@@ -1,5 +1,7 @@
 # forkstate
 
+[![CI](https://github.com/Forkscout/forkstate/actions/workflows/ci.yml/badge.svg)](https://github.com/Forkscout/forkstate/actions/workflows/ci.yml)
+
 A fork that does not copy.
 
 Mainnet state is read through to the parent chain the first time it is asked for;

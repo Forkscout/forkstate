@@ -1,0 +1,68 @@
+# The suite forks a real chain, so it needs a real archive node.
+#
+# That is deliberate rather than awkward: nearly every hard bug here has been
+# interop — a field some tool needed and did not get — and a suite against a mock
+# would have passed straight through all of them. The cost is that CI cannot run
+# without a `FORKSTATE_RPC` secret, so a fork's pull request runs the parts that
+# need no chain and says so.
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
+      - run: npm run typecheck
+
+  test:
+    runs-on: ubuntu-latest
+    # A pull request from a fork cannot see secrets, so it would fail on the
+    # first request rather than on anything it changed.
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: forkstate
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci --ignore-scripts || npm install --ignore-scripts
+
+      - name: SQLite
+        env:
+          FORKSTATE_RPC: ${{ secrets.FORKSTATE_RPC }}
+          FORKSTATE_TEST_PORT: 8699
+        run: npm test
+
+      # The same suite against the backend a deployment actually runs. Both have
+      # to pass: the two disagree in exactly the places that matter — conditional
+      # writes, and what a row reads back as.
+      - name: Postgres
+        env:
+          FORKSTATE_RPC: ${{ secrets.FORKSTATE_RPC }}
+          TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/forkstate
+          FORKSTATE_TEST_PORT: 8700
+        run: npm test
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t forkstate .
