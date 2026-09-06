@@ -25,6 +25,21 @@ import { UpstreamCache } from "../src/upstream-cache.ts";
 import { serve } from "../src/server.ts";
 
 const RPC = process.env.FORKSTATE_RPC;
+
+/*
+ * Locally, no archive node means the suite skips and says so — it is a fair
+ * thing to want to run the typecheck without one.
+ *
+ * In CI that is a trap. Everything here is inside one `describe` that skips as a
+ * whole, so a missing or expired secret produces a green build that ran nothing
+ * at all, and stays green until somebody notices. Better to stop.
+ */
+if (!RPC && process.env.CI) {
+    throw new Error(
+        "FORKSTATE_RPC is not set. In CI that means the secret is missing or expired — "
+        + "every test would be skipped and the build would pass without running one.",
+    );
+}
 const PORT = Number(process.env.FORKSTATE_TEST_PORT ?? 8699);
 const BASE = `http://127.0.0.1:${PORT}`;
 
