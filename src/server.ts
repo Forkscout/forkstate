@@ -1,0 +1,259 @@
+/**
+ * The HTTP front.
+ *
+ * Each environment gets its own path, so a wallet points at one URL and stays on
+ * one fork. The management API sits beside it rather than inside the JSON-RPC
+ * surface: creating and deleting environments is not something a dapp should be
+ * able to do through the same endpoint it sends transactions to.
+ */
+import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { timingSafeEqual } from "node:crypto";
+import { StaleEnvironment, type Manager } from "./manager.ts";
+import type { Environment } from "./environment.ts";
+import { UI } from "./ui.ts";
+import { limitsFromEnv, RateLimiter } from "./limits.ts";
+import { handleRpc } from "./rpc-server.ts";
+
+const MAX_BODY = 8 * 1024 * 1024;
+
+/** Any origin: this is a devnet, and refusing a browser is the only thing CORS could do here. */
+const CORS: Record<string, string> = {
+    "access-control-allow-origin": "*",
+    "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
+    "access-control-allow-headers": "content-type",
+    "access-control-max-age": "86400",
+};
+
+function body(req: IncomingMessage): Promise<string> {
+    return new Promise((resolve, reject) => {
+        let size = 0;
+        const chunks: Buffer[] = [];
+        req.on("data", (chunk: Buffer) => {
+            size += chunk.length;
+            if (size > MAX_BODY) {
+                reject(new Error("request body too large"));
+                req.destroy();
+                return;
+            }
+            chunks.push(chunk);
+        });
+        req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+        req.on("error", reject);
+    });
+}
+
+function send(res: ServerResponse, status: number, payload: unknown): void {
+    res.writeHead(status, { ...CORS, "content-type": "application/json" }).end(JSON.stringify(payload));
+}
+
+/*
+ * The engine has no idea who owns which environment — that is the console's job.
+ * So when it is reachable from anywhere, one shared secret decides who may ask
+ * it anything at all. Without it, a public URL serves every environment in the
+ * process to whoever guesses an eight-character id.
+ *
+ * Unset means open, which is right for a process bound to localhost or sitting
+ * on a private network.
+ */
+const KEY = process.env.FORKSTATE_KEY;
+
+function authorised(request: IncomingMessage): boolean {
+    if (!KEY) return true;
+    const offered = request.headers["x-forkstate-key"];
+    return typeof offered === "string" && offered.length === KEY.length && timingSafeEqual(
+        Buffer.from(offered), Buffer.from(KEY),
+    );
+}
+
+/**
+ * The methods that can change an environment.
+ *
+ * Named explicitly because the alternative — noticing afterwards that something
+ * changed — is too late: by then another request has already interleaved.
+ */
+/** Thrown inside the write queue, where returning a response is not possible. */
+class NoEnvironment extends Error {
+    constructor(id: string) {
+        super(`No environment "${id}".`);
+    }
+}
+
+const MUTATES =
+    /^(eth_sendTransaction|eth_sendRawTransaction|anvil_|evm_|forkstate_(setChainId|setTokenBalance|sync|followHead))/;
+
+const mutating = (payload: unknown): boolean => {
+    const one = (call: unknown) => MUTATES.test(String((call as { method?: unknown })?.method ?? ""));
+    return Array.isArray(payload) ? payload.some(one) : one(payload);
+};
+
+export function serve(manager: Manager, port: number, defaultRpc: string) {
+    /*
+     * One write at a time per environment.
+     *
+     * Two writes on one process share the in-memory environment, so their blocks
+     * are mixed together before either is written out: whichever persists first
+     * carries the other's block with it, and the other is then told its work was
+     * rejected when it is in fact on the chain. Reads are not queued — they take
+     * no lock, change nothing, and are the common case.
+     */
+    const writing = new Map<string, Promise<unknown>>();
+    function serialised<T>(id: string, work: () => Promise<T>): Promise<T> {
+        const queued = (writing.get(id) ?? Promise.resolve()).then(work, work);
+        // The chain, not the result: a failed write must not stop the next one.
+        const tail = queued.then(() => {}, () => {});
+        writing.set(id, tail);
+        // Dropped once nothing is behind it, so an idle environment leaves
+        // nothing in the map.
+        void tail.then(() => {
+            if (writing.get(id) === tail) writing.delete(id);
+        });
+        return queued;
+    }
+    // Off unless FORKSTATE_RATE says otherwise, so a local engine behaves the way
+    // it always has and a deployed one can be given a ceiling.
+    const limiter = new RateLimiter(limitsFromEnv());
+    const sweeping = limiter.unlimited ? null : setInterval(() => limiter.sweep(), 60_000);
+    sweeping?.unref?.();
+    const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+        void (async () => {
+            const url = new URL(req.url ?? "/", "http://localhost");
+            const path = url.pathname.replace(/\/+$/, "") || "/";
+
+            if (req.method === "OPTIONS") {
+                res.writeHead(204, CORS).end();
+                return;
+            }
+
+            if (!authorised(req)) {
+                return send(res, 401, { error: "This engine requires x-forkstate-key." });
+            }
+
+            try {
+                if (path === "/" && req.method === "GET") {
+                    // A browser cannot send the header, and a console in front of
+                    // this is the interface in that deployment anyway.
+                    if (KEY) return send(res, 404, { error: "Not found" });
+                    res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(UI);
+                    return;
+                }
+
+                // ---- management
+                if (path === "/environments" && req.method === "GET") {
+                    return send(res, 200, { environments: await manager.list(), live: manager.liveCount() });
+                }
+
+                if (path === "/environments" && req.method === "POST") {
+                    const options = JSON.parse((await body(req)) || "{}") as Record<string, unknown>;
+                    const created = await manager.create({
+                        rpcUrl: String(options.rpcUrl ?? defaultRpc),
+                        name: options.name as string | undefined,
+                        chainId: options.chainId === undefined ? undefined : Number(options.chainId),
+                        forkBlock: options.forkBlock === undefined ? undefined : BigInt(String(options.forkBlock)),
+                        checkpoint: options.checkpoint === undefined ? undefined : Number(options.checkpoint),
+                        followHead: options.followHead === undefined ? undefined : Boolean(options.followHead),
+                    });
+                    return send(res, 201, {
+                        id: created.id,
+                        rpcUrl: `http://127.0.0.1:${port}/${created.id}`,
+                        chainId: created.env.chainId,
+                        forkBlock: "0x" + created.env.forkBlock.toString(16),
+                        followsHead: created.env.followsHead,
+                    });
+                }
+
+                const single = /^\/environments\/([0-9a-f-]+)$/.exec(path);
+                if (single?.[1] && req.method === "DELETE") {
+                    return send(res, 200, { deleted: await manager.delete(single[1]) });
+                }
+
+                // ---- JSON-RPC, one environment per path
+                if (req.method === "POST") {
+                    const id = path === "/" ? "default" : path.slice(1);
+                    const payload = JSON.parse(await body(req)) as unknown;
+
+                    // Charged per call, so a batch costs what it actually is.
+                    const cost = Array.isArray(payload) ? Math.max(payload.length, 1) : 1;
+                    const allowed = limiter.take(id, cost);
+                    if (!allowed.ok) {
+                        res.setHeader("retry-after", Math.ceil(allowed.retryAfter / 1000));
+                        return send(res, 429, {
+                            jsonrpc: "2.0",
+                            id: null,
+                            error: {
+                                // The code Ethereum clients already use for this, so
+                                // a wallet backs off instead of reporting a failure.
+                                code: -32005,
+                                message: "This testnet is over its request limit.",
+                                data: { retryAfterMs: allowed.retryAfter },
+                            },
+                        });
+                    }
+
+                    // Batches are how wallets and indexers actually talk; answering one
+                    // at a time makes them look broken rather than slow.
+                    const run = async (env: Environment) => (Array.isArray(payload)
+                        ? await Promise.all(payload.map((one) => handleRpc(env, one as Record<string, unknown>)))
+                        : await handleRpc(env, payload as Record<string, unknown>));
+
+                    if (!mutating(payload)) {
+                        // Reads change nothing, so they neither queue nor persist.
+                        const env = await manager.get(id);
+                        if (!env) return send(res, 404, { error: `No environment "${id}".` });
+                        return send(res, 200, await run(env));
+                    }
+
+                    try {
+                        /*
+                         * The environment is fetched inside the queue, not before
+                         * it: a write ahead of this one may have lost and dropped
+                         * it, and running against the copy that was dropped would
+                         * build on state that is no longer there.
+                         */
+                        const result = await serialised(id, async () => {
+                            const env = await manager.get(id);
+                            if (!env) throw new NoEnvironment(id);
+                            const answer = await run(env);
+
+                            /*
+                             * Only when something actually changed, and before the
+                             * reply rather than after: if the write loses to another
+                             * process the caller must hear about it instead of a
+                             * receipt for a transaction that was thrown away.
+                             */
+                            await manager.persist(id, env);
+                            return answer;
+                        });
+                        return send(res, 200, result);
+                    } catch (error) {
+                        if (error instanceof NoEnvironment) {
+                            return send(res, 404, { error: `No environment "${id}".` });
+                        }
+                        if (!(error instanceof StaleEnvironment)) throw error;
+                        return send(res, 409, {
+                            jsonrpc: "2.0",
+                            id: null,
+                            error: {
+                                // Not a client mistake and not a broken node: the
+                                // same request sent again will work, because the
+                                // environment is reloaded before it runs.
+                                code: -32000,
+                                message: "This testnet was changed elsewhere; nothing was applied. "
+                                    + "Send it again.",
+                            },
+                        });
+                    }
+                }
+
+                send(res, 404, { error: "Not found" });
+            } catch (error) {
+                send(res, 400, {
+                    jsonrpc: "2.0", id: null,
+                    error: { code: -32700, message: error instanceof Error ? error.message : "bad request" },
+                });
+            }
+        })();
+    });
+
+    server.listen(port);
+    return server;
+}
