@@ -48,5 +48,13 @@
     "README.md",
     "CONTRIBUTING.md",
     "LICENSE"
-  ]
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Forkscout/forkstate.git"
+  },
+  "homepage": "https://github.com/Forkscout/forkstate#readme",
+  "bugs": {
+    "url": "https://github.com/Forkscout/forkstate/issues"
+  }
 }
