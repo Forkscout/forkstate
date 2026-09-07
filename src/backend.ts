@@ -60,6 +60,10 @@ export interface Backend {
      * rewritten on every block — putting them there would mean rewriting every
      * trace the environment has ever produced each time anything happens.
      */
+    /** Adds to each environment's running totals for a day. */
+    addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>): Promise<void>;
+    readUsage(envId: string, since: string): Promise<Array<{ day: string; requests: number; misses: number }>>;
+
     saveTrace(envId: string, hash: string, trace: string, diff: string): Promise<void>;
     loadTrace(envId: string, hash: string): Promise<{ trace: string; diff: string } | null>;
     deleteTraces(envId: string): Promise<void>;
@@ -101,6 +105,13 @@ CREATE TABLE IF NOT EXISTS traces (
     trace   TEXT NOT NULL,
     diff    TEXT NOT NULL,
     PRIMARY KEY (env_id, hash)
+);
+CREATE TABLE IF NOT EXISTS usage (
+    env_id   TEXT NOT NULL,
+    day      TEXT NOT NULL,
+    requests INTEGER NOT NULL DEFAULT 0,
+    misses   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (env_id, day)
 );
 `;
 
@@ -177,6 +188,21 @@ class SqliteBackend implements Backend {
         return Number(this.db.prepare("DELETE FROM environments WHERE id = ?").run(id).changes) > 0;
     }
 
+    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>) {
+        const statement = this.db.prepare(`
+            INSERT INTO usage (env_id, day, requests, misses) VALUES (?, ?, ?, ?)
+            ON CONFLICT(env_id, day) DO UPDATE SET
+                requests = usage.requests + excluded.requests,
+                misses   = usage.misses   + excluded.misses`);
+        for (const e of entries) statement.run(e.envId, e.day, e.requests, e.misses);
+    }
+
+    async readUsage(envId: string, since: string) {
+        return this.db.prepare(
+            "SELECT day, requests, misses FROM usage WHERE env_id = ? AND day >= ? ORDER BY day")
+            .all(envId, since) as Array<{ day: string; requests: number; misses: number }>;
+    }
+
     async saveTrace(envId: string, hash: string, trace: string, diff: string) {
         this.db.prepare(
             "INSERT OR REPLACE INTO traces (env_id, hash, trace, diff) VALUES (?, ?, ?, ?)")
@@ -245,6 +271,13 @@ CREATE INDEX IF NOT EXISTS environments_updated ON environments (updated_at DESC
  * so nothing in flight is disturbed by the column appearing.
  */
 ALTER TABLE environments ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS usage (
+    env_id   text NOT NULL,
+    day      text NOT NULL,
+    requests bigint NOT NULL DEFAULT 0,
+    misses   bigint NOT NULL DEFAULT 0,
+    PRIMARY KEY (env_id, day)
+);
 CREATE TABLE IF NOT EXISTS upstream (
     key   text PRIMARY KEY,
     value text NOT NULL,
@@ -321,6 +354,29 @@ class PostgresBackend implements Backend {
 
     async deleteEnvironment(id: string) {
         return (await this.sql`DELETE FROM environments WHERE id = ${id}`).count > 0;
+    }
+
+    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>) {
+        if (entries.length === 0) return;
+        const rows = entries.map((e) => ({
+            env_id: e.envId, day: e.day, requests: e.requests, misses: e.misses,
+        }));
+        // One statement for the batch: the meter exists to stop paying for round
+        // trips, so it should not spend one per environment per flush.
+        await this.sql`
+            INSERT INTO usage ${this.sql(rows, "env_id", "day", "requests", "misses")}
+            ON CONFLICT (env_id, day) DO UPDATE SET
+                requests = usage.requests + EXCLUDED.requests,
+                misses   = usage.misses   + EXCLUDED.misses`;
+    }
+
+    async readUsage(envId: string, since: string) {
+        const rows = await this.sql`
+            SELECT day, requests, misses FROM usage
+            WHERE env_id = ${envId} AND day >= ${since} ORDER BY day`;
+        return rows.map((r) => ({
+            day: String(r.day), requests: Number(r.requests), misses: Number(r.misses),
+        }));
     }
 
     async saveTrace(envId: string, hash: string, trace: string, diff: string) {

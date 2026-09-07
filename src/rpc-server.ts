@@ -475,6 +475,17 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
 
             // ---- this environment, described
             case "forkstate_overlay": return reply(env.exportOverlay());
+            /*
+             * What this environment has cost.
+             *
+             * Requests and misses, per day. The miss is the number that matters:
+             * a warm call is answered from the shared cache in milliseconds and
+             * costs nothing, while a miss is a paid request to the parent chain.
+             */
+            case "forkstate_usage": {
+                const days = params[0] === undefined ? 30 : Math.min(Number(params[0]), 365);
+                return reply(await env.usage(days));
+            }
             case "forkstate_size": return reply(env.size());
             case "forkstate_cache": return reply(await env.cacheStats());
             case "forkstate_info": return reply({

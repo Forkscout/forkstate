@@ -98,6 +98,7 @@ overlay as it was.
 | `forkstate_sync` | Move a following fork to the parent's head now |
 | `forkstate_followHead` | Turn head-following on or off |
 | `forkstate_setChainId` | Change the id; signatures follow it |
+| `forkstate_usage` | Requests and cold reads, per day — takes a number of days, default 30 |
 
 ### Verification
 

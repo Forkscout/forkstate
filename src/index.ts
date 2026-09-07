@@ -7,6 +7,7 @@
  */
 import { Environment } from "./environment.ts";
 import { Manager } from "./manager.ts";
+import { Meter } from "./meter.ts";
 import { Store } from "./store.ts";
 import { openBackend } from "./backend.ts";
 import { UpstreamCache } from "./upstream-cache.ts";
@@ -48,8 +49,17 @@ const backend = await openBackend({ url: DATABASE_URL, path: DB });
 const store = new Store(backend);
 // The same place, because the cache is only useful when it outlives one process.
 const cache = CACHE_DB === null ? new UpstreamCache(null) : new UpstreamCache(backend);
+/*
+ * What each environment costs, counted and written in batches.
+ *
+ * Batched because the whole point of the cache is to stop paying for round
+ * trips, and a meter that wrote a row per read would spend more of them than it
+ * measured.
+ */
+const meter = new Meter(store);
+
 const manager = new Manager(store, {
-    cache, checkpoint: CHECKPOINT, chainId: CHAIN_ID, syncInterval: SYNC_INTERVAL,
+    cache, checkpoint: CHECKPOINT, chainId: CHAIN_ID, syncInterval: SYNC_INTERVAL, meter,
 });
 
 // A "default" environment so a bare URL works, the way a single-chain node does.
@@ -70,7 +80,7 @@ if (!(await manager.get("default"))) {
     });
 }
 
-serve(manager, PORT, RPC);
+serve(manager, PORT, RPC, meter);
 
 const preset = await manager.get("default");
 console.log(`forkstate on http://127.0.0.1:${PORT}`);

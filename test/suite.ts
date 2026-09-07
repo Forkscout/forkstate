@@ -21,6 +21,7 @@ import { Manager, StaleEnvironment } from "../src/manager.ts";
 import { Store } from "../src/store.ts";
 import { openBackend } from "../src/backend.ts";
 import { limitsFromEnv, RateLimiter } from "../src/limits.ts";
+import { Meter } from "../src/meter.ts";
 import { UpstreamCache } from "../src/upstream-cache.ts";
 import { serve } from "../src/server.ts";
 
@@ -73,6 +74,7 @@ let dir: string;
 let server: { close(): void };
 /** The same store the manager uses, so a test can look at what was written. */
 let store: Store;
+let meter: Meter;
 /** Held so a test can evict an environment, which is what a restart looks like. */
 let manager: Manager;
 
@@ -124,11 +126,15 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         dir = mkdtempSync(join(tmpdir(), "forkstate-test-"));
         const backend = await openBackend({ url: process.env.TEST_DATABASE_URL, path: join(dir, "t.db") });
         store = new Store(backend);
+        // No timer: the tests that care flush by hand, and a background flush
+        // racing an assertion is a flake nobody enjoys chasing.
+        meter = new Meter(store, 0);
         manager = new Manager(store, {
             cache: new UpstreamCache(backend),
             checkpoint: 100,
+            meter,
         });
-        server = serve(manager, PORT, RPC!);
+        server = serve(manager, PORT, RPC!, meter);
     });
 
     after(() => {
@@ -1014,6 +1020,97 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const body = await response.json() as { error: { message: string } };
             assert.match(body.error.message, /changed elsewhere/);
             assert.match(body.error.message, /again/, "and it should say what to do");
+        });
+    });
+
+    describe("what an environment costs", () => {
+        it("counts a cold read and not a warm one", async () => {
+            /*
+             * The distinction the whole meter exists for. A warm call is answered
+             * from the shared cache in single-digit milliseconds and costs
+             * nobody anything; a cold one waits on the parent chain, and that is
+             * a paid request. Metering requests alone would bill them the same.
+             */
+            const meter = new Meter(null);
+            const env = await newEnv({ name: "meter-cold" });
+            const ok = okFor(env.id);
+            const held = (await manager.get(env.id))!;
+            held.onUpstreamFetch = () => meter.miss(env.id);
+
+            // A contract nothing in this process has touched yet.
+            const TOKEN = "0x0E09FaBB73Bd3Ade0a17ECC321fD13a19e81cE82";
+            await ok("eth_call", [ { to: TOKEN, data: "0x18160ddd" }, "latest" ]);
+            const cold = meter.unflushed(env.id).misses;
+            assert.ok(cold > 0, "reading a contract for the first time must count");
+
+            await ok("eth_call", [ { to: TOKEN, data: "0x18160ddd" }, "latest" ]);
+            assert.equal(meter.unflushed(env.id).misses, cold,
+                "the same call again is served from the cache and must cost nothing");
+        });
+
+        it("keeps counting after the state manager is replaced", async () => {
+            // A chain-id change rebuilds the state manager whole. A hook that
+            // lived only on it would go quiet, and the bill would quietly stop.
+            const meter = new Meter(null);
+            const env = await newEnv({ name: "meter-rebuild" });
+            const ok = okFor(env.id);
+            const held = (await manager.get(env.id))!;
+            held.onUpstreamFetch = () => meter.miss(env.id);
+
+            await ok("forkstate_setChainId", [ 4477 ]);
+            await ok("eth_call", [
+                { to: "0x2170Ed0880ac9A755fd29B2688956BD959F933F8", data: "0x18160ddd" }, "latest" ]);
+            assert.ok(meter.unflushed(env.id).misses > 0,
+                "the meter must survive a rebuilt state manager");
+        });
+
+        it("charges a batch for every call in it", () => {
+            const meter = new Meter(null);
+            meter.request("a", 12);
+            assert.equal(meter.unflushed("a").requests, 12);
+        });
+
+        it("keeps one environment's usage off another's", () => {
+            const meter = new Meter(null);
+            meter.request("a", 3);
+            meter.miss("b");
+            assert.deepEqual(meter.unflushed("a"), { requests: 3, misses: 0 });
+            assert.deepEqual(meter.unflushed("b"), { requests: 0, misses: 1 });
+        });
+
+        it("writes totals out, and adds to what is already there", async () => {
+            const meter = new Meter(store, 0);   // no timer; flushed by hand
+            const id = "meter-" + Math.random().toString(16).slice(2, 8);
+            meter.request(id, 5);
+            meter.miss(id);
+            await meter.flush();
+
+            meter.request(id, 2);
+            await meter.flush();
+
+            const rows = await store.readUsage(id, "2000-01-01");
+            assert.equal(rows.length, 1, "one row per day, added to rather than replaced");
+            assert.equal(rows[0]!.requests, 7);
+            assert.equal(rows[0]!.misses, 1);
+        });
+
+        it("does not lose usage when the write fails", async () => {
+            const broken = { addUsage: async () => { throw new Error("database is away"); } };
+            const meter = new Meter(broken, 0);
+            meter.request("a", 4);
+            await meter.flush();
+            assert.equal(meter.unflushed("a").requests, 4,
+                "usage that vanishes because the database blinked is usage nobody is billed for");
+        });
+
+        it("reports itself over RPC", async () => {
+            const env = await newEnv({ name: "meter-rpc" });
+            const ok = okFor(env.id);
+            await ok("eth_call", [
+                { to: "0xbb4CdB9CBd36B01bD1cBaEBF2De08d9173bc095c", data: "0x18160ddd" }, "latest" ]);
+            const usage = await ok("forkstate_usage", [ 30 ]);
+            assert.ok(usage.total, "it should report a total");
+            assert.ok(usage.total.requests > 0, "the calls just made should be in it");
         });
     });
 

@@ -60,11 +60,24 @@ export class ForkStateManager extends RPCStateManager {
     }
 
     /** A parent read, answered from the shared cache when anyone has asked it before. */
+    /**
+     * Called whenever a read actually went to the parent chain.
+     *
+     * Here rather than in the cache, because the cache is shared by every
+     * environment and cannot say which one caused the fetch — and that is
+     * exactly what has to be attributed.
+     */
+    onUpstreamFetch: (() => void) | null = null;
+
     private async cached(kind: string, address: string, slot: string | undefined, fetchIt: () => Promise<string>): Promise<string> {
-        if (!this.shared) return fetchIt();
+        if (!this.shared) {
+            this.onUpstreamFetch?.();
+            return fetchIt();
+        }
         const key = UpstreamCache.key(this.chainKey, this.tag, kind, address, slot);
         const hit = await this.shared.get(key);
         if (hit !== null) return hit;
+        this.onUpstreamFetch?.();
         const value = await fetchIt();
         this.shared.set(key, value);
         return value;

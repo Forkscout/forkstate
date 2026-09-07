@@ -222,6 +222,28 @@ retries hard can still climb out.
 The buckets are in memory. That is exact and free for one process, and it means
 two processes each allow the configured rate.
 
+## What it costs
+
+Requests are the obvious thing to count and almost the wrong one:
+
+```
+warm call (from the shared cache)     9–13 ms   costs nothing
+cold call (fetched from the parent)  400–860 ms  a paid request
+```
+
+Ten thousand warm calls are cheaper than a hundred cold ones, so both are
+counted per environment per day and the miss is the number that matters.
+`forkstate_usage` reports them:
+
+```json
+{ "total": { "requests": 18422, "misses": 311 },
+  "days": [ { "day": "2026-09-07", "requests": 18422, "misses": 311 } ] }
+```
+
+Written in batches, never a row per read — the cache exists to stop paying for
+round trips, and a meter that spent one per read would cost more than it
+measured. Usage that fails to write is kept and retried rather than dropped.
+
 ## More than one process
 
 Environments live in memory, so two processes can hold the same one and both

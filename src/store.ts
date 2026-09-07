@@ -101,6 +101,15 @@ export class Store {
         });
     }
 
+    /** Running totals per environment per day. Written in batches, never per read. */
+    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>): Promise<void> {
+        await this.backend.addUsage(entries);
+    }
+
+    async readUsage(envId: string, since: string): Promise<Array<{ day: string; requests: number; misses: number }>> {
+        return this.backend.readUsage(envId, since);
+    }
+
     /** A transaction's trace and diff, kept for as long as the environment is. */
     async saveTrace(envId: string, hash: string, trace: string, diff: string): Promise<void> {
         await this.backend.saveTrace(envId, hash, trace, diff);

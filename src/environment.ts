@@ -250,6 +250,26 @@ export class Environment {
      * state tabs of every transaction already in the explorer, which is exactly
      * the history a person opens an explorer to read.
      */
+    /**
+     * Told when this environment causes a read of the parent chain.
+     *
+     * The expensive thing, and the only one worth metering: a warm call is
+     * milliseconds and free, a cold one is most of a second and is somebody's
+     * paid request.
+     */
+    set onUpstreamFetch(fn: (() => void) | null) {
+        this.upstreamFetch = fn;
+        this.state.onUpstreamFetch = fn;
+    }
+
+    /**
+     * Kept here as well as on the state manager, because the state manager is
+     * replaced whole — on a chain-id change, a head sync, a revert — and a hook
+     * that lived only on it would go quiet after the first of those, which is
+     * the sort of thing nobody notices until a bill is wrong.
+     */
+    private upstreamFetch: (() => void) | null = null;
+
     archive: {
         save(hash: string, trace: Trace, diff: StateDiff | null): Promise<void>;
         load(hash: string): Promise<{ trace: Trace; diff: StateDiff | null } | null>;
@@ -965,6 +985,7 @@ export class Environment {
     /** Replaces the state manager with a clean one and replays the overlay onto it. */
     private async rebuildState(): Promise<void> {
         this.state = new ForkStateManager({ provider: this.rpcUrl, blockTag: this.forkBlock, cache: this.cache });
+        this.state.onUpstreamFetch = this.upstreamFetch;
         this.common = new Common({ chain: { ...Mainnet, chainId: this.chainId } });
         this.vm = await createVM({ common: this.common, stateManager: this.state });
         this.recordWrites();
@@ -1110,6 +1131,18 @@ export class Environment {
                 address,
                 codeSize: (account.code!.length - 2) / 2,
             }));
+    }
+
+    /**
+     * Reads this environment's own usage back.
+     *
+     * Wired by the manager, which is the only thing that knows what this
+     * environment is called and where the totals are kept.
+     */
+    usageReader: ((days: number) => Promise<unknown>) | null = null;
+
+    async usage(days: number): Promise<unknown> {
+        return this.usageReader ? this.usageReader(days) : { days: [], note: "not metered" };
     }
 
     /** What a transaction changed. */

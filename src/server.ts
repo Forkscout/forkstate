@@ -10,6 +10,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { timingSafeEqual } from "node:crypto";
 import { StaleEnvironment, type Manager } from "./manager.ts";
 import type { Environment } from "./environment.ts";
+import type { Meter } from "./meter.ts";
 import { UI } from "./ui.ts";
 import { limitsFromEnv, RateLimiter } from "./limits.ts";
 import { handleRpc } from "./rpc-server.ts";
@@ -84,7 +85,7 @@ const mutating = (payload: unknown): boolean => {
     return Array.isArray(payload) ? payload.some(one) : one(payload);
 };
 
-export function serve(manager: Manager, port: number, defaultRpc: string) {
+export function serve(manager: Manager, port: number, defaultRpc: string, meter?: Meter) {
     /*
      * One write at a time per environment.
      *
@@ -187,6 +188,7 @@ export function serve(manager: Manager, port: number, defaultRpc: string) {
 
                     // Charged per call, so a batch costs what it actually is.
                     const cost = Array.isArray(payload) ? Math.max(payload.length, 1) : 1;
+                    meter?.request(id, cost);
                     const allowed = limiter.take(id, cost);
                     if (!allowed.ok) {
                         res.setHeader("retry-after", Math.ceil(allowed.retryAfter / 1000));

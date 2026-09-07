@@ -9,6 +9,7 @@
 import { randomUUID } from "node:crypto";
 import { Environment } from "./environment.ts";
 import { Store, type EnvironmentSummary } from "./store.ts";
+import type { Meter } from "./meter.ts";
 
 /**
  * Raised when an environment was written by someone else while we held it.
@@ -51,6 +52,8 @@ export interface ManagerDefaults {
     chainId?: number;
     /** Seconds between head syncs for environments that follow it; 0 turns it off. */
     syncInterval?: number;
+    /** Where each environment's cold reads are counted, if anywhere. */
+    meter?: Meter | null;
 }
 
 interface Held {
@@ -74,6 +77,7 @@ interface Held {
 export class Manager {
     private readonly live = new Map<string, Held>();
     private readonly store: Store;
+    private readonly meter: Meter | null = null;
     private readonly cache: UpstreamCache | null;
     private readonly checkpoint: number;
     private readonly chainId: number | undefined;
@@ -86,6 +90,7 @@ export class Manager {
         this.checkpoint = defaults.checkpoint ?? 0;
         this.chainId = defaults.chainId;
         this.syncInterval = defaults.syncInterval ?? 0;
+        this.meter = defaults.meter ?? null;
         if (this.syncInterval > 0) {
             this.syncTimer = setInterval(() => void this.syncFollowers(), this.syncInterval * 1000);
             // A sync is housekeeping; it should never be the reason a process stays up.
@@ -129,6 +134,7 @@ export class Manager {
         });
         env.followsHead = options.followHead ?? false;
         this.archive(id, env);
+        this.measure(id, env);
         this.live.set(id, {
             env,
             rpcUrl: options.rpcUrl,
@@ -160,6 +166,7 @@ export class Manager {
         // doing so the first time the process restarts.
         env.followsHead = saved.followsHead;
         this.archive(id, env);
+        this.measure(id, env);
         this.live.set(id, {
             env, rpcUrl: saved.rpcUrl, name: saved.name, createdAt: saved.createdAt,
             revision: saved.revision,
@@ -185,6 +192,35 @@ export class Manager {
      * Done here rather than in `Environment` because an environment does not know
      * what it is called — the id belongs to the manager that handed it out.
      */
+    /**
+     * Points an environment's cold reads at the meter, under its own id.
+     *
+     * Same reason as the archive: the environment does not know what it is
+     * called, and attribution is the whole point.
+     */
+    private measure(id: string, env: Environment): void {
+        if (!this.meter) return;
+        env.onUpstreamFetch = () => this.meter!.miss(id);
+        env.usageReader = async (days) => {
+            const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+            const written = await this.store.readUsage(id, since);
+            // Plus whatever has happened since the last flush, so the number a
+            // person is looking at is not up to half a minute behind.
+            const live = this.meter!.unflushed(id);
+            const total = written.reduce(
+                (sum, d) => ({ requests: sum.requests + d.requests, misses: sum.misses + d.misses }),
+                { requests: 0, misses: 0 });
+            return {
+                days: written,
+                total: {
+                    requests: total.requests + live.requests,
+                    misses: total.misses + live.misses,
+                },
+                pending: live,
+            };
+        };
+    }
+
     private archive(id: string, env: Environment): void {
         env.archive = {
             save: async (hash, trace, diff) => {
