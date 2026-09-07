@@ -55,13 +55,11 @@ function send(res: ServerResponse, status: number, payload: unknown): void {
  * Unset means open, which is right for a process bound to localhost or sitting
  * on a private network.
  */
-const KEY = process.env.FORKSTATE_KEY;
-
-function authorised(request: IncomingMessage): boolean {
-    if (!KEY) return true;
+function authorised(request: IncomingMessage, key: string | undefined): boolean {
+    if (!key) return true;
     const offered = request.headers["x-forkstate-key"];
-    return typeof offered === "string" && offered.length === KEY.length && timingSafeEqual(
-        Buffer.from(offered), Buffer.from(KEY),
+    return typeof offered === "string" && offered.length === key.length && timingSafeEqual(
+        Buffer.from(offered), Buffer.from(key),
     );
 }
 
@@ -111,6 +109,9 @@ export function serve(manager: Manager, port: number, defaultRpc: string) {
     }
     // Off unless FORKSTATE_RATE says otherwise, so a local engine behaves the way
     // it always has and a deployed one can be given a ceiling.
+    // Read here rather than at module load, so it is set the same way the rate
+    // limit is — and so a test can start an engine that actually has one.
+    const key = process.env.FORKSTATE_KEY;
     const limiter = new RateLimiter(limitsFromEnv());
     const sweeping = limiter.unlimited ? null : setInterval(() => limiter.sweep(), 60_000);
     sweeping?.unref?.();
@@ -124,7 +125,20 @@ export function serve(manager: Manager, port: number, defaultRpc: string) {
                 return;
             }
 
-            if (!authorised(req)) {
+            /*
+             * The one thing answered without a key.
+             *
+             * A host that cannot tell whether a process is wedged cannot restart
+             * it, and every other endpoint needs the header — so a deployment
+             * with a key set had no healthcheck at all. This says only that the
+             * event loop is still turning, which is what a healthcheck is for and
+             * is not worth protecting.
+             */
+            if (path === "/health" && req.method === "GET") {
+                return send(res, 200, { ok: true });
+            }
+
+            if (!authorised(req, key)) {
                 return send(res, 401, { error: "This engine requires x-forkstate-key." });
             }
 
@@ -132,7 +146,7 @@ export function serve(manager: Manager, port: number, defaultRpc: string) {
                 if (path === "/" && req.method === "GET") {
                     // A browser cannot send the header, and a console in front of
                     // this is the interface in that deployment anyway.
-                    if (KEY) return send(res, 404, { error: "Not found" });
+                    if (key) return send(res, 404, { error: "Not found" });
                     res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(UI);
                     return;
                 }

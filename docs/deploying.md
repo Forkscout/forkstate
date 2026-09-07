@@ -82,6 +82,10 @@ being hammered with parallel transactions, one process serves it better than two
 
 ## Health
 
-`GET /environments` with the key returns every environment and how many are held
-in memory. It is a fine healthcheck as long as the key is sent — without it the
-answer is `401`, which a healthcheck will read as unhealthy forever.
+`GET /health` answers `{"ok":true}` without a key. It is the one endpoint that
+does: a host that cannot tell whether a process is wedged cannot restart it, and
+everything else needs the header, so an engine with a key set would otherwise
+have no healthcheck at all. It reports liveness and nothing else.
+
+`GET /environments`, with the key, returns every environment and how many are
+held in memory — the same thing plus the detail, for a human.

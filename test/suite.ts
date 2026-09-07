@@ -106,6 +106,19 @@ function okFor(id: string) {
     };
 }
 
+/**
+ * Puts an environment variable back the way it was.
+ *
+ * `process.env.X = undefined` sets the string "undefined", which is truthy —
+ * so restoring an unset variable this way leaves it set to nonsense. It cost a
+ * run where every request came back 401 because the key was literally
+ * "undefined".
+ */
+function restoreEnv(name: string, previous: string | undefined): void {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+}
+
 describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => {
     before(async () => {
         dir = mkdtempSync(join(tmpdir(), "forkstate-test-"));
@@ -1004,6 +1017,38 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("the healthcheck", () => {
+        it("answers without a key, and says nothing else", async () => {
+            // Every other endpoint needs the header, so a deployment with a key
+            // set had nothing a host could poll — and a wedged process would
+            // never be restarted.
+            const response = await fetch(`${BASE}/health`);
+            assert.equal(response.status, 200);
+            assert.deepEqual(await response.json(), { ok: true },
+                "it should report liveness and not the contents of the process");
+        });
+
+        it("is still the only thing open, on an engine that has a key", async () => {
+            // The suite's own engine has no key, so this needs one of its own —
+            // and that is the deployment the healthcheck exists for.
+            const previous = process.env.FORKSTATE_KEY;
+            process.env.FORKSTATE_KEY = "a-key-for-this-test";
+            const port = PORT + 501;
+            const guarded = serve(manager, port, RPC!);
+            restoreEnv("FORKSTATE_KEY", previous);
+
+            try {
+                assert.equal((await fetch(`http://127.0.0.1:${port}/health`)).status, 200);
+                for (const path of [ "/environments", "/default" ]) {
+                    assert.equal((await fetch(`http://127.0.0.1:${port}${path}`)).status, 401,
+                        `${path} must still need the key`);
+                }
+            } finally {
+                guarded.close();
+            }
+        });
+    });
+
     describe("the request limit", () => {
         // A clock the test moves, so a rate measured per second does not need a
         // test that waits seconds.
@@ -1079,7 +1124,7 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             process.env.FORKSTATE_RATE = "2";
             const limitedPort = PORT + 500;
             const limited = serve(manager, limitedPort, RPC!);
-            process.env.FORKSTATE_RATE = previous;
+            restoreEnv("FORKSTATE_RATE", previous);
 
             try {
                 const env = await newEnv({ name: "rate-limited" });

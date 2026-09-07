@@ -74,6 +74,9 @@ disappear.
 | `FORKSTATE_BURST` | `5 × rate` | How many may arrive at once before that rate applies |
 | `FORKSTATE_SOLC_DIR` | `./data/solc` | Where downloaded compilers are kept for verification |
 
+`GET /health` answers `{"ok":true}` without a key, so a host can tell whether the
+process is alive. Everything else needs the header when one is set.
+
 That last one is not cosmetic. A wallet that recognises chain 56 will answer some
 questions from its own infrastructure rather than from the node it was given —
 token balances come back right and the native balance comes back as whatever the
