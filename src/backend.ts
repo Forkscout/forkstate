@@ -244,6 +244,9 @@ class SqliteBackend implements Backend {
 
 // ---- Postgres ---------------------------------------------------------------
 
+/** One number every process agrees on, so they queue rather than deadlock. */
+const SCHEMA_LOCK = 8_314_206;
+
 const POSTGRES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS traces (
     env_id  TEXT NOT NULL,
@@ -321,7 +324,33 @@ class PostgresBackend implements Backend {
             // reads like a stack of errors on a healthy boot.
             onnotice: () => {},
         });
-        await sql.unsafe(POSTGRES_SCHEMA);
+        /*
+         * At most one process runs the DDL at a time.
+         *
+         * `ALTER TABLE` takes an exclusive lock, and two replicas starting
+         * together take them in whatever order they get there — which deadlocks,
+         * and the loser dies on boot. The console hit exactly this and it showed
+         * up as a share of every request failing.
+         *
+         * A cheap look first, because after the first start there is nothing to
+         * do; the lock is inside a transaction so a pooled connection cannot
+         * hand the release to somebody else.
+         */
+        let current = false;
+        try {
+            const [ row ] = await sql`
+                SELECT 1 FROM information_schema.columns
+                WHERE table_name = 'environments' AND column_name = 'revision' LIMIT 1`;
+            current = Boolean(row);
+        } catch {
+            // Nothing there yet. Create it below.
+        }
+        if (!current) {
+            await sql.begin(async (tx) => {
+                await tx`SELECT pg_advisory_xact_lock(${ SCHEMA_LOCK })`;
+                await tx.unsafe(POSTGRES_SCHEMA);
+            });
+        }
         return new PostgresBackend(sql);
     }
 
