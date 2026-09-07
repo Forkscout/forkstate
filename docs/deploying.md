@@ -80,6 +80,16 @@ is its own row. Concurrent writes to a *single* environment do not: they are
 serialised within a process and conflict across processes. If one testnet is
 being hammered with parallel transactions, one process serves it better than two.
 
+### One thing to get right on Railway
+
+If you set a healthcheck, the port it probes has to be the port the engine is
+listening on. Railway injects its own `PORT`, and `FORKSTATE_PORT` overrides it —
+so setting only `FORKSTATE_PORT` leaves the healthcheck probing a port nothing is
+bound to. The deploy then fails with no error in the logs at all: the container
+starts, prints its banner, and is stopped a moment later.
+
+Set both to the same number, or set neither and let `PORT` decide.
+
 ## Health
 
 `GET /health` answers `{"ok":true}` without a key. It is the one endpoint that
