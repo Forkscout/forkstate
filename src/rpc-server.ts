@@ -494,6 +494,14 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
                 blockNumber: env.blockNumber(),
                 followsHead: env.followsHead,
                 size: env.size(),
+                /*
+                 * How much this fork has produced.
+                 *
+                 * Here because the alternative is asking for every block to count
+                 * them, and a page that wants only a number should not have to
+                 * fetch the whole chain to get it.
+                 */
+                counts: env.counts(),
             });
             // Pull this fork up to the parent's current head, keeping its writes.
             case "forkstate_sync": {

@@ -1145,6 +1145,12 @@ export class Environment {
         return this.usageReader ? this.usageReader(days) : { days: [], note: "not metered" };
     }
 
+    /** How many blocks and transactions this fork has produced. */
+    counts(): { blocks: number; transactions: number } {
+        const chain = this.chain.export();
+        return { blocks: chain.blocks.length, transactions: chain.txs.length };
+    }
+
     /** What a transaction changed. */
     async getDiff(hash: string): Promise<StateDiff | null> {
         const key = hash.toLowerCase();
