@@ -90,6 +90,14 @@ starts, prints its banner, and is stopped a moment later.
 
 Set both to the same number, or set neither and let `PORT` decide.
 
+### Adding a dependency
+
+The image installs with `bun install --frozen-lockfile`, so a dependency added
+with `npm install` alone is in `package.json` and `package-lock.json` and not in
+`bun.lock`. That image builds, starts, passes its healthcheck and then cannot
+import the module it was built for. Run `bun install --lockfile-only` and commit
+`bun.lock` with the change.
+
 ## Health
 
 `GET /health` answers `{"ok":true}` without a key. It is the one endpoint that
