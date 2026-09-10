@@ -247,6 +247,9 @@ class SqliteBackend implements Backend {
 /** One number every process agrees on, so they queue rather than deadlock. */
 const SCHEMA_LOCK = 8_314_206;
 
+/** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
+const SCHEMA_VERSION = 1;
+
 const POSTGRES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS traces (
     env_id  TEXT NOT NULL,
@@ -274,6 +277,10 @@ CREATE INDEX IF NOT EXISTS environments_updated ON environments (updated_at DESC
  * so nothing in flight is disturbed by the column appearing.
  */
 ALTER TABLE environments ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0;
+CREATE TABLE IF NOT EXISTS schema_meta (
+    id      int PRIMARY KEY,
+    version int NOT NULL
+);
 CREATE TABLE IF NOT EXISTS usage (
     env_id   text NOT NULL,
     day      text NOT NULL,
@@ -336,19 +343,29 @@ class PostgresBackend implements Backend {
          * do; the lock is inside a transaction so a pooled connection cannot
          * hand the release to somebody else.
          */
-        let current = false;
+        /*
+         * The version, not whichever column happened to be newest.
+         *
+         * Checking for a column looks equivalent and is not: it is true the
+         * moment that column is added and says nothing about anything added
+         * afterwards, so the next new table is silently never created. The
+         * console had exactly that and it stayed hidden until something read
+         * the missing table.
+         */
+        let current = 0;
         try {
-            const [ row ] = await sql`
-                SELECT 1 FROM information_schema.columns
-                WHERE table_name = 'environments' AND column_name = 'revision' LIMIT 1`;
-            current = Boolean(row);
+            const [ row ] = await sql`SELECT version FROM schema_meta LIMIT 1`;
+            current = Number(row?.version ?? 0);
         } catch {
-            // Nothing there yet. Create it below.
+            // No marker: an empty database, or one from before this existed.
         }
-        if (!current) {
+        if (current < SCHEMA_VERSION) {
             await sql.begin(async (tx) => {
                 await tx`SELECT pg_advisory_xact_lock(${ SCHEMA_LOCK })`;
                 await tx.unsafe(POSTGRES_SCHEMA);
+                await tx`
+                    INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
+                    ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version`;
             });
         }
         return new PostgresBackend(sql);
