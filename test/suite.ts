@@ -24,6 +24,7 @@ import { limitsFromEnv, RateLimiter } from "../src/limits.ts";
 import { Meter } from "../src/meter.ts";
 import { UpstreamCache } from "../src/upstream-cache.ts";
 import { serve } from "../src/server.ts";
+import { signSocketUrl } from "../src/ws-server.ts";
 
 const RPC = process.env.FORKSTATE_RPC;
 
@@ -105,6 +106,72 @@ function okFor(id: string) {
         const r = await call(method, params);
         if (r.error) throw new Error(`${method}: ${r.error.message}`);
         return r.result;
+    };
+}
+
+/**
+ * A socket client that keeps answers and pushed events apart.
+ *
+ * A subscription arrives on the same connection as the reply to the call that
+ * created it, so a test that only awaited the next message would sometimes get
+ * an event and sometimes a result. Answers are matched by id; anything with a
+ * method is an event.
+ */
+async function openSocket(id: string, query = ""): Promise<{
+    call(method: string, params?: unknown[]): Promise<any>;
+    events: Array<{ subscription: string; result: any }>;
+    /** Resolves once `count` events have arrived, or throws when they do not. */
+    waitFor(count: number, within?: number): Promise<void>;
+    close(): void;
+}> {
+    const { WebSocket } = await import("ws");
+    const socket = new WebSocket(`ws://127.0.0.1:${PORT}/${id}${query ? "?" + query : ""}`);
+    const pending = new Map<number, { resolve(v: any): void; reject(e: Error): void }>();
+    const events: Array<{ subscription: string; result: any }> = [];
+    let next = 1;
+
+    await new Promise<void>((resolve, reject) => {
+        socket.once("open", () => resolve());
+        socket.once("error", reject);
+        socket.once("close", (code: number, reason: Buffer) =>
+            reject(new Error(`closed ${code}: ${reason.toString()}`)));
+    });
+
+    socket.on("message", (raw: Buffer) => {
+        const message = JSON.parse(raw.toString()) as any;
+        if (message.method === "eth_subscription") {
+            events.push(message.params);
+            return;
+        }
+        const waiting = pending.get(message.id);
+        if (!waiting) return;
+        pending.delete(message.id);
+        if (message.error) waiting.reject(new Error(message.error.message));
+        else waiting.resolve(message.result);
+    });
+
+    return {
+        call(method, params = []) {
+            const id = next++;
+            return new Promise((resolve, reject) => {
+                pending.set(id, { resolve, reject });
+                socket.send(JSON.stringify({ jsonrpc: "2.0", id, method, params }));
+                setTimeout(() => {
+                    if (pending.delete(id)) reject(new Error(`${method} never answered`));
+                }, 20_000).unref?.();
+            });
+        },
+        events,
+        async waitFor(count, within = 10_000) {
+            const deadline = Date.now() + within;
+            while (events.length < count) {
+                if (Date.now() > deadline) {
+                    throw new Error(`only ${events.length} of ${count} events arrived`);
+                }
+                await new Promise((r) => setTimeout(r, 25));
+            }
+        },
+        close() { socket.close(); },
     };
 }
 
@@ -1048,6 +1115,224 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const answer = await call("forkstate_simulateBundle", [{ transactions: [] }]);
             assert.ok(answer.error, "it should fail here, with our message");
             assert.match(answer.error!.message, /bundle/);
+        });
+    });
+
+    describe("subscriptions over a socket", () => {
+        const transfer = (to: string, amount: bigint) => "0xa9059cbb" + pad(to) + word(amount);
+
+        it("announces every block it mines", async () => {
+            const env = await newEnv({ name: "ws-heads" });
+            const socket = await openSocket(env.id);
+            try {
+                const id = await socket.call("eth_subscribe", [ "newHeads" ]);
+                assert.match(id, /^0x[0-9a-f]+$/);
+
+                await socket.call("anvil_mine", [ "0x3" ]);
+                await socket.waitFor(3);
+
+                const numbers = socket.events.map((e) => BigInt(e.result.number));
+                assert.equal(socket.events[0]!.subscription, id);
+                assert.equal(numbers[1], numbers[0]! + 1n, "and in order");
+                assert.equal(socket.events[0]!.result.transactions, undefined,
+                    "a head is a header, not a block");
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("stops announcing once unsubscribed", async () => {
+            const env = await newEnv({ name: "ws-unsub" });
+            const socket = await openSocket(env.id);
+            try {
+                const id = await socket.call("eth_subscribe", [ "newHeads" ]);
+                await socket.call("anvil_mine", [ "0x1" ]);
+                await socket.waitFor(1);
+
+                assert.equal(await socket.call("eth_unsubscribe", [ id ]), true);
+                await socket.call("anvil_mine", [ "0x2" ]);
+                // Nothing to wait for, so give it the time it would have needed.
+                await new Promise((r) => setTimeout(r, 300));
+                assert.equal(socket.events.length, 1, "the two later blocks are not ours");
+
+                assert.equal(await socket.call("eth_unsubscribe", [ id ]), false,
+                    "and unsubscribing twice is not an error, just false");
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("sends only the logs a filter asked for", async () => {
+            const env = await newEnv({ name: "ws-logs" });
+            const ok = okFor(env.id);
+            await ok("forkstate_setTokenBalance", [ USDT, SIGNER, "0x" + (10n ** 20n).toString(16) ]);
+
+            const socket = await openSocket(env.id);
+            try {
+                // keccak("Transfer(address,address,uint256)")
+                const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+                await socket.call("eth_subscribe", [ "logs", { address: USDT, topics: [ TRANSFER ] } ]);
+                // A subscription that cannot match, to prove the filter is applied.
+                await socket.call("eth_subscribe", [ "logs", { address: DEAD } ]);
+
+                await ok("eth_sendTransaction", [
+                    { from: SIGNER, to: USDT, data: transfer(DEAD, 10n ** 18n) },
+                ]);
+                await socket.waitFor(1);
+                await new Promise((r) => setTimeout(r, 200));
+
+                assert.equal(socket.events.length, 1, "only the matching subscription fires");
+                assert.equal(socket.events[0]!.result.address.toLowerCase(), USDT.toLowerCase());
+                assert.equal(socket.events[0]!.result.topics[0], TRANSFER);
+                assert.notEqual(socket.events[0]!.result.blockHash, "0x" + "0".repeat(64),
+                    "a log must name the block it is in, not a block of zeroes");
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("takes a list of alternatives in one topic position", async () => {
+            // `topics: [[a, b]]` means "a or b". Treating the array as a single
+            // topic makes the subscription match nothing and look like a quiet chain.
+            const env = await newEnv({ name: "ws-topics" });
+            const ok = okFor(env.id);
+            await ok("forkstate_setTokenBalance", [ USDT, SIGNER, "0x" + (10n ** 20n).toString(16) ]);
+
+            const socket = await openSocket(env.id);
+            try {
+                const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+                const APPROVAL = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925";
+                await socket.call("eth_subscribe", [ "logs", { topics: [ [ APPROVAL, TRANSFER ] ] } ]);
+
+                await ok("eth_sendTransaction", [
+                    { from: SIGNER, to: USDT, data: transfer(DEAD, 1n) },
+                ]);
+                await socket.waitFor(1);
+                assert.equal(socket.events[0]!.result.topics[0], TRANSFER);
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("announces a transaction's hash to a pending subscription", async () => {
+            const env = await newEnv({ name: "ws-pending" });
+            const ok = okFor(env.id);
+            const socket = await openSocket(env.id);
+            try {
+                await socket.call("eth_subscribe", [ "newPendingTransactions" ]);
+                const hash = await ok("eth_sendTransaction", [ { from: SIGNER, to: DEAD, value: "0x0" } ]);
+                await socket.waitFor(1);
+                assert.equal(socket.events[0]!.result, hash);
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("answers ordinary calls on the same connection", async () => {
+            // A client opens one socket and expects to use it for everything;
+            // making it keep an HTTP connection alongside would be absurd.
+            const env = await newEnv({ name: "ws-rpc" });
+            const socket = await openSocket(env.id);
+            try {
+                assert.equal(BigInt(await socket.call("eth_chainId", [])), BigInt(env.chainId));
+                const supply = await socket.call("eth_call", [ { to: USDT, data: "0x18160ddd" }, "latest" ]);
+                assert.ok(BigInt(supply) > 0n);
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("persists a transaction sent over the socket", async () => {
+            // The queue and the write-out are the HTTP side's; a socket that
+            // skipped them would mine blocks that vanish on the next restart.
+            const env = await newEnv({ name: "ws-write" });
+            const socket = await openSocket(env.id);
+            try {
+                await socket.call("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+                const before = BigInt(await okFor(env.id)("eth_getBalance", [ DEAD, "latest" ]));
+                const hash = await socket.call("eth_sendTransaction", [
+                    { from: SIGNER, to: DEAD, value: "0xde0b6b3a7640000" },
+                ]);
+                assert.ok(hash);
+                const stored = await store.load(env.id);
+                assert.ok(stored, "the environment should have been written out");
+                const after = BigInt(await okFor(env.id)("eth_getBalance", [ DEAD, "latest" ]));
+                assert.equal(after - before, 10n ** 18n, "and the HTTP side should see it");
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("refuses to open a socket for an environment that does not exist", async () => {
+            // Refused at the handshake, so the client gets a status it can print
+            // rather than a socket that opens and immediately shuts.
+            await assert.rejects(() => openSocket("nope-not-real"), /404/);
+        });
+
+        it("says what it cannot subscribe to", async () => {
+            const env = await newEnv({ name: "ws-unknown" });
+            const socket = await openSocket(env.id);
+            try {
+                await assert.rejects(
+                    () => socket.call("eth_subscribe", [ "syncing" ]),
+                    /newHeads, logs and newPendingTransactions/,
+                );
+            } finally {
+                socket.close();
+            }
+        });
+
+        it("still tells an HTTP caller where to go", async () => {
+            const env = await newEnv({ name: "ws-http" });
+            const answer = await rpcFor(env.id)("eth_subscribe", [ "newHeads" ]);
+            assert.match(answer.error!.message, /ws:\/\/ or wss:\/\//);
+        });
+
+        describe("with a key set", () => {
+            it("opens for a signature and refuses without one", async () => {
+                const previous = process.env.FORKSTATE_KEY;
+                process.env.FORKSTATE_KEY = "socket-secret";
+                const port = PORT + 1;
+                const guarded = serve(manager, port, RPC!, meter);
+                try {
+                    const created = await fetch(`http://127.0.0.1:${port}/environments`, {
+                        method: "POST",
+                        headers: { "content-type": "application/json", "x-forkstate-key": "socket-secret" },
+                        body: JSON.stringify({ name: "ws-guarded" }),
+                    }).then((r) => r.json()) as { id: string };
+
+                    const { WebSocket } = await import("ws");
+                    const opened = (url: string) => new Promise<boolean>((resolve) => {
+                        const socket = new WebSocket(url);
+                        socket.once("open", () => { socket.close(); resolve(true); });
+                        socket.once("error", () => resolve(false));
+                    });
+
+                    assert.equal(await opened(`ws://127.0.0.1:${port}/${created.id}`), false,
+                        "no signature, no socket");
+
+                    const exp = Math.floor(Date.now() / 1000) + 600;
+                    const query = signSocketUrl("socket-secret", created.id, exp);
+                    assert.equal(await opened(`ws://127.0.0.1:${port}/${created.id}?${query}`), true);
+
+                    // A signature is for one environment; another id must not reuse it.
+                    const other = await fetch(`http://127.0.0.1:${port}/environments`, {
+                        method: "POST",
+                        headers: { "content-type": "application/json", "x-forkstate-key": "socket-secret" },
+                        body: JSON.stringify({ name: "ws-guarded-2" }),
+                    }).then((r) => r.json()) as { id: string };
+                    assert.equal(await opened(`ws://127.0.0.1:${port}/${other.id}?${query}`), false);
+
+                    const stale = signSocketUrl(
+                        "socket-secret", created.id, Math.floor(Date.now() / 1000) - 1,
+                    );
+                    assert.equal(await opened(`ws://127.0.0.1:${port}/${created.id}?${stale}`), false,
+                        "and an expired one is no signature at all");
+                } finally {
+                    guarded.close();
+                    restoreEnv("FORKSTATE_KEY", previous);
+                }
+            });
         });
     });
 

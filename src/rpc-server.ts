@@ -239,11 +239,17 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
                 return fail(`${method}: this node holds no keys — sign in your wallet and use `
                     + `eth_sendRawTransaction, or use anvil_impersonateAccount`, -32601);
 
-            // Subscriptions need a socket to push down, and this server is HTTP.
+            /*
+             * Handled by the socket layer, which never reaches this.
+             *
+             * Arriving here means the caller asked over HTTP, where there is
+             * nothing to push an event down. The same URL with ws:// or wss://
+             * is the answer, so the message says that rather than "unsupported".
+             */
             case "eth_subscribe":
             case "eth_unsubscribe":
-                return fail(`${method} needs a WebSocket connection; poll with eth_newFilter `
-                    + `and eth_getFilterChanges instead`, -32601);
+                return fail(`${method} needs a WebSocket connection. Open this same URL with `
+                    + `ws:// or wss://, or poll with eth_newFilter and eth_getFilterChanges.`, -32601);
 
             // A proof is a claim about a trie this fork does not build, and the
             // parent's proof would omit everything the overlay has written —

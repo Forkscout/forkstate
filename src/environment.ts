@@ -20,6 +20,7 @@ import type { VM } from "@ethereumjs/vm";
 import { emptyOverlay, normaliseAddress, normaliseWord, overlaySize, type Overlay } from "./overlay.ts";
 import { Chain, type StoredBlock, type StoredTx } from "./chain.ts";
 import { attachTracer, type Trace, type TraceOptions } from "./tracer.ts";
+import { logMatches, type LogFilter } from "./logs.ts";
 import type { Log, TransactionRequest } from "./types.ts";
 
 export interface EnvironmentOptions {
@@ -201,7 +202,7 @@ function signedChainId(raw: Uint8Array): bigint | undefined {
  */
 interface Filter {
     kind: "log" | "block";
-    criteria: { address?: string | string[]; topics?: (string | null)[]; fromBlock?: number; toBlock?: number };
+    criteria: LogFilter & { fromBlock?: number; toBlock?: number };
     /** The last height already reported, so a poll returns only what is new. */
     cursor: number;
 }
@@ -354,6 +355,14 @@ export class Environment {
      * its suppression switched off underneath it.
      */
     private suppress = false;
+    /**
+     * Told about every block this environment mines.
+     *
+     * A set of callbacks rather than an EventEmitter: there is exactly one event
+     * and exactly one thing listening for it — the socket layer — and a typed
+     * function is easier to be sure about than a string.
+     */
+    private readonly watchers = new Set<(block: StoredBlock, txs: StoredTx[]) => void>();
     private nextFilterId = 1;
     private autoImpersonate = false;
     /** Off while a call runs: a call is reverted, so what it wrote is not ours to keep. */
@@ -928,6 +937,9 @@ export class Environment {
         tx.blockHash = block.hash;
         for (const log of tx.logs) log.blockHash = block.hash;
 
+        // Last, when the block, the receipt and every log in it are all true.
+        this.announce(block, [ tx ]);
+
         return tx;
     }
 
@@ -1057,15 +1069,43 @@ export class Environment {
         this.overlay.blockNumber = this.chain.length;
     }
 
+    /**
+     * Watches for blocks, and returns the way to stop.
+     *
+     * Announced after the block is complete rather than as it is built: a
+     * transaction learns its block hash only once the block exists, and a
+     * subscriber told earlier would be handed logs pointing at a block of
+     * zeroes — which is exactly the kind of thing an indexer stores forever.
+     */
+    watch(listener: (block: StoredBlock, txs: StoredTx[]) => void): () => void {
+        this.watchers.add(listener);
+        return () => { this.watchers.delete(listener); };
+    }
+
+    /** Never lets a listener's failure reach the transaction that mined the block. */
+    private announce(block: StoredBlock, txs: StoredTx[]): void {
+        for (const watcher of this.watchers) {
+            try {
+                watcher(block, txs);
+            } catch (error) {
+                console.error("a block watcher threw:", error);
+            }
+        }
+    }
+
     /** Produces empty blocks, for a contract that counts them. */
     mine(count = 1): number {
-        for (let i = 0; i < count; i++) this.mineBlock([], 0n);
+        for (let i = 0; i < count; i++) {
+            this.mineBlock([], 0n);
+            this.announce(this.chain.latest()!, []);
+        }
         return this.chain.height;
     }
 
     increaseTime(seconds: number): number {
         this.timeOffset += seconds;
         this.mineBlock([], 0n);
+        this.announce(this.chain.latest()!, []);
         return this.timeOffset;
     }
 
@@ -1509,20 +1549,17 @@ export class Environment {
         return this.filters.delete(id);
     }
 
-    getLogs(filter: { fromBlock?: number; toBlock?: number; address?: string | string[]; topics?: (string | null)[] }): Log[] {
+    getLogs(filter: LogFilter & { fromBlock?: number; toBlock?: number }): Log[] {
         const from = filter.fromBlock ?? 0;
         const to = filter.toBlock ?? Number.MAX_SAFE_INTEGER;
-        const addresses = filter.address
-            ? new Set((Array.isArray(filter.address) ? filter.address : [ filter.address ]).map(normaliseAddress))
-            : null;
 
         const out: Log[] = [];
         for (const tx of this.chain.recentTxs(Number.MAX_SAFE_INTEGER).reverse()) {
             if (tx.blockNumber < from || tx.blockNumber > to) continue;
             for (const log of tx.logs) {
-                if (addresses && !addresses.has(normaliseAddress(log.address))) continue;
-                if (filter.topics?.some((wanted, i) => wanted !== null && wanted !== undefined && log.topics[i] !== wanted)) continue;
-                out.push(log);
+                // The same matcher a subscription uses, so backfilling with this
+                // and then following with eth_subscribe cannot disagree.
+                if (logMatches(log, filter)) out.push(log);
             }
         }
         return out;

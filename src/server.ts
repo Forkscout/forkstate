@@ -14,6 +14,8 @@ import type { Meter } from "./meter.ts";
 import { UI } from "./ui.ts";
 import { limitsFromEnv, RateLimiter } from "./limits.ts";
 import { handleRpc } from "./rpc-server.ts";
+import { mutating, WriteQueue } from "./write-queue.ts";
+import { serveSockets } from "./ws-server.ts";
 
 const MAX_BODY = 8 * 1024 * 1024;
 
@@ -77,47 +79,9 @@ class NoEnvironment extends Error {
     }
 }
 
-/*
- * `simulateBundle` is in here despite changing nothing.
- *
- * It runs inside a checkpoint it always reverts, so the overlay comes out as it
- * went in — but it holds that checkpoint open across many transactions, and a
- * real transaction landing in the middle would be committed into it and then
- * thrown away with it. Queueing it costs a simulation waiting behind a write,
- * which is the cheaper of the two. Persisting is a no-op for it either way,
- * since nothing it does moves the environment's version.
- */
-const MUTATES =
-    /^(eth_sendTransaction|eth_sendRawTransaction|anvil_|evm_|forkstate_(setChainId|setTokenBalance|sync|followHead|simulateBundle))/;
-
-const mutating = (payload: unknown): boolean => {
-    const one = (call: unknown) => MUTATES.test(String((call as { method?: unknown })?.method ?? ""));
-    return Array.isArray(payload) ? payload.some(one) : one(payload);
-};
 
 export function serve(manager: Manager, port: number, defaultRpc: string, meter?: Meter) {
-    /*
-     * One write at a time per environment.
-     *
-     * Two writes on one process share the in-memory environment, so their blocks
-     * are mixed together before either is written out: whichever persists first
-     * carries the other's block with it, and the other is then told its work was
-     * rejected when it is in fact on the chain. Reads are not queued — they take
-     * no lock, change nothing, and are the common case.
-     */
-    const writing = new Map<string, Promise<unknown>>();
-    function serialised<T>(id: string, work: () => Promise<T>): Promise<T> {
-        const queued = (writing.get(id) ?? Promise.resolve()).then(work, work);
-        // The chain, not the result: a failed write must not stop the next one.
-        const tail = queued.then(() => {}, () => {});
-        writing.set(id, tail);
-        // Dropped once nothing is behind it, so an idle environment leaves
-        // nothing in the map.
-        void tail.then(() => {
-            if (writing.get(id) === tail) writing.delete(id);
-        });
-        return queued;
-    }
+    const queue = new WriteQueue();
     // Off unless FORKSTATE_RATE says otherwise, so a local engine behaves the way
     // it always has and a deployed one can be given a ceiling.
     // Read here rather than at module load, so it is set the same way the rate
@@ -235,7 +199,7 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
                          * it, and running against the copy that was dropped would
                          * build on state that is no longer there.
                          */
-                        const result = await serialised(id, async () => {
+                        const result = await queue.run(id, async () => {
                             const env = await manager.get(id);
                             if (!env) throw new NoEnvironment(id);
                             const answer = await run(env);
@@ -279,6 +243,16 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
             }
         })();
     });
+
+    /*
+     * The socket endpoint, on the same port.
+     *
+     * Given the same queue, so a transaction sent over a socket cannot land in
+     * the middle of one sent over HTTP, and the same limiter, so a socket is a
+     * cheaper way to ask rather than a free one.
+     */
+    const websockets = serveSockets({ server, manager, key, limiter, meter, queue });
+    server.on("close", () => websockets.close());
 
     server.listen(port);
     return server;

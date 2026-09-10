@@ -107,6 +107,40 @@ reverted transaction still spends its nonce, as it would on a chain, and gets no
 what it tried. Nothing is mined and nothing reaches the overlay. Up to 64
 transactions per bundle.
 
+### Subscriptions
+
+Open the same URL with `ws://` or `wss://` and `eth_subscribe` works:
+
+```js
+const provider = new ethers.WebSocketProvider(wsUrl);
+provider.on("block", (n) => console.log(n));
+```
+
+| Subscription | Sends |
+| --- | --- |
+| `newHeads` | The header of every block this fork mines |
+| `logs` | Logs matching `{ address, topics }` |
+| `newPendingTransactions` | The hash of each transaction |
+
+`topics` is positional, and each position may be a topic, `null` for anything,
+or a list of alternatives — `[[transfer, approval]]` is "either of these".
+`eth_getLogs` and a subscription use the same matcher, so backfilling with one
+and following with the other cannot disagree.
+
+A fork mines as it receives, so nothing stays pending: `newPendingTransactions`
+fires when the block is made, which is a beat later than a real chain and is
+what the subscriber was waiting for either way.
+
+The socket answers ordinary calls too, so one connection is enough. Writes sent
+over it queue with the ones sent over HTTP and are written out before the reply,
+exactly as they are there. A ping every 30 seconds keeps an idle subscription
+from being dropped by something in the middle.
+
+A deployed engine has a key, and a browser cannot put a header on a WebSocket
+handshake. So the console signs one environment id and an expiry and appends
+`?exp=…&sig=…`; the engine checks it. The result is a URL that can be handed to
+a wallet: it opens one environment, cannot be edited into another, and expires.
+
 ### Cheatcodes
 
 `anvil_setBalance`, `anvil_setNonce`, `anvil_setCode`, `anvil_setStorageAt`,
@@ -147,7 +181,6 @@ alongside it.
 | --- | --- |
 | `eth_getProof` | The parent's proof is a signed claim that this fork's writes do not exist |
 | `eth_sign`, `eth_signTransaction` | No key is ever held here — sign in your wallet, send the raw transaction |
-| `eth_subscribe` | Needs a socket; poll a filter instead |
 
 ## Errors worth handling
 

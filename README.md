@@ -109,6 +109,10 @@ checkpoint the call is already thrown away with, so nothing reaches the fork.
 Geth's `state`, which blanks every slot not listed, is refused: the slots a fork
 would have to blank are the ones it has never read.
 
+**Subscriptions:** the same URL with `ws://` or `wss://` speaks `eth_subscribe`
+— `newHeads`, `logs`, `newPendingTransactions` — and ordinary calls, so one
+connection does everything.
+
 **Bundles:** `forkstate_simulateBundle` runs several transactions in order, each
 seeing what the one before it did, and keeps none of it. An approve followed by
 a swap is two `eth_call`s that fail separately and one bundle that works. A
@@ -136,9 +140,8 @@ once and run in a process of its own, so a slow or failing compile cannot stall
 the RPC every other environment is being served from.
 
 **Refused, with a reason:** `eth_getProof` (the parent's proof is a signed claim
-that this fork's writes do not exist), `eth_sign` and `eth_signTransaction` (no
-key is ever held here — sign in your wallet and send the raw transaction), and
-`eth_subscribe` (needs a socket; poll a filter instead).
+that this fork's writes do not exist), and `eth_sign` and `eth_signTransaction`
+(no key is ever held here — sign in your wallet and send the raw transaction).
 
 **Forwarded to the parent:** everything else — history from before the fork,
 which the parent has and this process never will.

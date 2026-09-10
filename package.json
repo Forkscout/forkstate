@@ -2,7 +2,7 @@
   "name": "forkstate",
   "version": "0.1.0",
   "type": "module",
-  "description": "A fork that does not copy \u2014 mainnet state read through on demand, writes kept in an overlay.",
+  "description": "A fork that does not copy — mainnet state read through on demand, writes kept in an overlay.",
   "scripts": {
     "dev": "node --watch --experimental-strip-types src/index.ts",
     "start": "node --experimental-strip-types src/index.ts",
@@ -22,10 +22,12 @@
     "@ethereumjs/vm": "^10.1.3",
     "@noble/hashes": "^2.4.0",
     "postgres": "^3.4.9",
-    "solc": "^0.8.36"
+    "solc": "^0.8.36",
+    "ws": "^8.21.3"
   },
   "devDependencies": {
     "@types/node": "^26.4.1",
+    "@types/ws": "^8.18.1",
     "typescript": "^7.0.2"
   },
   "license": "MIT",
