@@ -397,6 +397,16 @@ const SCHEMA_LOCK = 8_314_206;
 /** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
 const SCHEMA_VERSION = 2;
 
+/**
+ * Which row of `schema_meta` is the engine's.
+ *
+ * The console shares this database and has its own schema and its own version
+ * number. Both wrote to row 1 and both read the first row they found, so the
+ * console's version 5 told the engine it was five migrations ahead of itself and
+ * the engine's next table was silently never created. One row each.
+ */
+const SCHEMA_ROW = 2;
+
 const POSTGRES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS traces (
     env_id  TEXT NOT NULL,
@@ -525,7 +535,8 @@ class PostgresBackend implements Backend {
          */
         let current = 0;
         try {
-            const [ row ] = await sql`SELECT version FROM schema_meta LIMIT 1`;
+            const [ row ] = await sql`
+                SELECT version FROM schema_meta WHERE id = ${SCHEMA_ROW} LIMIT 1`;
             current = Number(row?.version ?? 0);
         } catch {
             // No marker: an empty database, or one from before this existed.
@@ -535,7 +546,8 @@ class PostgresBackend implements Backend {
                 await tx`SELECT pg_advisory_xact_lock(${ SCHEMA_LOCK })`;
                 await tx.unsafe(POSTGRES_SCHEMA);
                 await tx`
-                    INSERT INTO schema_meta (id, version) VALUES (1, ${SCHEMA_VERSION})
+                    INSERT INTO schema_meta (id, version)
+                    VALUES (${SCHEMA_ROW}, ${SCHEMA_VERSION})
                     ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version`;
             });
         }
