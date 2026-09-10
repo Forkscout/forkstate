@@ -109,6 +109,11 @@ checkpoint the call is already thrown away with, so nothing reaches the fork.
 Geth's `state`, which blanks every slot not listed, is refused: the slots a fork
 would have to blank are the ones it has never read.
 
+**Alerts:** a rule on an environment — a log filter, a transaction filter, or
+every block — and a URL it posts to, signed with a secret so the receiver can
+tell it from anyone who found the URL. Fires only for blocks that were written
+out, so a webhook never describes a transaction nobody can find.
+
 **Subscriptions:** the same URL with `ws://` or `wss://` speaks `eth_subscribe`
 — `newHeads`, `logs`, `newPendingTransactions` — and ordinary calls, so one
 connection does everything.

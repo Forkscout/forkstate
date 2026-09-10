@@ -17,6 +17,7 @@ import { createFeeMarket1559Tx, createLegacyTx } from "@ethereumjs/tx";
 import { Common, Mainnet } from "@ethereumjs/common";
 import { bytesToHex, hexToBytes, privateToAddress } from "@ethereumjs/util";
 import { keccak_256 } from "@noble/hashes/sha3.js";
+import { createHmac } from "node:crypto";
 import { Manager, StaleEnvironment } from "../src/manager.ts";
 import { Store } from "../src/store.ts";
 import { openBackend } from "../src/backend.ts";
@@ -24,6 +25,7 @@ import { limitsFromEnv, RateLimiter } from "../src/limits.ts";
 import { Meter } from "../src/meter.ts";
 import { UpstreamCache } from "../src/upstream-cache.ts";
 import { serve } from "../src/server.ts";
+import { Alerts } from "../src/alerts.ts";
 import { signSocketUrl } from "../src/ws-server.ts";
 
 const RPC = process.env.FORKSTATE_RPC;
@@ -176,6 +178,55 @@ async function openSocket(id: string, query = ""): Promise<{
 }
 
 /**
+ * Somewhere for a webhook to arrive.
+ *
+ * A real socket on localhost rather than a stubbed `fetch`: the thing worth
+ * testing is that a body goes out over HTTP with a signature a receiver can
+ * check, and a stub proves none of that.
+ */
+async function receiver(options: { status?: number } = {}): Promise<{
+    url: string;
+    received: Array<{ body: any; raw: string; signature: string; alert: string }>;
+    waitFor(count: number, within?: number): Promise<void>;
+    close(): void;
+}> {
+    const { createServer } = await import("node:http");
+    const received: Array<{ body: any; raw: string; signature: string; alert: string }> = [];
+    const server = createServer((req, res) => {
+        let raw = "";
+        req.on("data", (chunk) => { raw += String(chunk); });
+        req.on("end", () => {
+            received.push({
+                raw,
+                body: JSON.parse(raw || "{}"),
+                signature: String(req.headers["x-forkstate-signature"] ?? ""),
+                alert: String(req.headers["x-forkstate-alert"] ?? ""),
+            });
+            res.writeHead(options.status ?? 200).end("ok");
+        });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as { port: number }).port;
+    return {
+        // Private, and refused unless the engine was started with
+        // FORKSTATE_ALERTS_ALLOW_LOCAL — which these tests do, because the
+        // receiver they need is on this machine.
+        url: `http://127.0.0.1:${port}/hook`,
+        received,
+        async waitFor(count, within = 10_000) {
+            const deadline = Date.now() + within;
+            while (received.length < count) {
+                if (Date.now() > deadline) {
+                    throw new Error(`only ${received.length} of ${count} deliveries arrived`);
+                }
+                await new Promise((r) => setTimeout(r, 25));
+            }
+        },
+        close() { server.close(); },
+    };
+}
+
+/**
  * Puts an environment variable back the way it was.
  *
  * `process.env.X = undefined` sets the string "undefined", which is truthy —
@@ -201,7 +252,7 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             checkpoint: 100,
             meter,
         });
-        server = serve(manager, PORT, RPC!, meter);
+        server = serve(manager, PORT, RPC!, meter, new Alerts(backend));
     });
 
     after(() => {
@@ -1333,6 +1384,301 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
                     restoreEnv("FORKSTATE_KEY", previous);
                 }
             });
+        });
+    });
+
+    describe("alerts", () => {
+        const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+        const transfer = (to: string, amount: bigint) => "0xa9059cbb" + pad(to) + word(amount);
+
+        /** These tests need a receiver on this machine, which is refused by default. */
+        let allowedLocal: string | undefined;
+        before(() => {
+            allowedLocal = process.env.FORKSTATE_ALERTS_ALLOW_LOCAL;
+            process.env.FORKSTATE_ALERTS_ALLOW_LOCAL = "1";
+        });
+        after(() => restoreEnv("FORKSTATE_ALERTS_ALLOW_LOCAL", allowedLocal));
+
+        it("posts when a transaction matches, signed with the alert's secret", async () => {
+            const env = await newEnv({ name: "alert-tx" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                const alert = await ok("forkstate_createAlert", [
+                    { name: "any transaction", url: hook.url, kind: "transactions" },
+                ]);
+                assert.ok(alert.secret, "the secret is handed over once, here");
+
+                await ok("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+                const hash = await ok("eth_sendTransaction", [
+                    { from: SIGNER, to: DEAD, value: "0xde0b6b3a7640000" },
+                ]);
+                await hook.waitFor(1);
+
+                const [ delivery ] = hook.received;
+                assert.equal(delivery!.alert, alert.id);
+                assert.equal(delivery!.body.matches[0].transaction.hash, hash);
+                assert.equal(delivery!.body.matches[0].transaction.status, "success");
+                assert.ok(delivery!.body.block.hash, "and which block it was in");
+
+                // The signature is the whole point: a receiver has to be able to
+                // tell this from anyone who found the URL.
+                const expected = createHmac("sha256", alert.secret).update(delivery!.raw).digest("hex");
+                assert.equal(delivery!.signature, `sha256=${expected}`);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("sends only what the rule asks for", async () => {
+            const env = await newEnv({ name: "alert-filter" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                await ok("forkstate_createAlert", [
+                    { name: "only failures", url: hook.url, kind: "transactions",
+                        criteria: { status: "failed" } },
+                ]);
+                await ok("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+
+                // Succeeds, so nothing should go out.
+                await ok("eth_sendTransaction", [ { from: SIGNER, to: DEAD, value: "0x1" } ]);
+                await new Promise((r) => setTimeout(r, 400));
+                assert.equal(hook.received.length, 0, "a success is not a failure");
+
+                // Reverts: no allowance, no balance, no chance.
+                await ok("eth_sendTransaction", [
+                    { from: DEAD, to: USDT, data: transfer(SIGNER, 10n ** 30n) },
+                ]);
+                await hook.waitFor(1);
+                assert.equal(hook.received[0]!.body.matches[0].transaction.status, "reverted");
+                assert.match(hook.received[0]!.body.matches[0].transaction.revertReason,
+                    /exceeds balance/, "and it says why, decoded");
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("matches logs the same way a subscription does", async () => {
+            const env = await newEnv({ name: "alert-logs" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                await ok("forkstate_createAlert", [
+                    { name: "usdt transfers", url: hook.url, kind: "logs",
+                        criteria: { address: USDT, topics: [ TRANSFER ] } },
+                ]);
+                await ok("forkstate_setTokenBalance", [ USDT, SIGNER, "0x" + (10n ** 20n).toString(16) ]);
+                await ok("eth_sendTransaction", [
+                    { from: SIGNER, to: USDT, data: transfer(DEAD, 10n ** 18n) },
+                ]);
+                await hook.waitFor(1);
+
+                const match = hook.received[0]!.body.matches[0];
+                assert.equal(match.type, "log");
+                assert.equal(match.log.topics[0], TRANSFER);
+                assert.equal(match.log.address.toLowerCase(), USDT.toLowerCase());
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("says nothing for a block that matches nothing", async () => {
+            const env = await newEnv({ name: "alert-quiet" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                await ok("forkstate_createAlert", [
+                    { name: "a token nobody touches", url: hook.url, kind: "logs",
+                        criteria: { address: DEAD } },
+                ]);
+                await ok("anvil_mine", [ "0x2" ]);
+                await new Promise((r) => setTimeout(r, 400));
+                assert.equal(hook.received.length, 0);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("fires on every block when that is what was asked for", async () => {
+            const env = await newEnv({ name: "alert-blocks" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                await ok("forkstate_createAlert", [
+                    { name: "every block", url: hook.url, kind: "blocks" },
+                ]);
+                await ok("anvil_mine", [ "0x2" ]);
+                await hook.waitFor(2);
+                assert.equal(hook.received[0]!.body.matches[0].type, "block");
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("records what happened, including a refusal", async () => {
+            const env = await newEnv({ name: "alert-deliveries" });
+            const ok = okFor(env.id);
+            const hook = await receiver({ status: 500 });
+            try {
+                const alert = await ok("forkstate_createAlert", [
+                    { name: "broken endpoint", url: hook.url, kind: "blocks" },
+                ]);
+                await ok("anvil_mine", [ "0x1" ]);
+                // Three attempts, a second apart, before it gives up on this one.
+                await hook.waitFor(3, 15_000);
+
+                const deliveries = await ok("forkstate_alertDeliveries", [ alert.id ]);
+                assert.equal(deliveries.length, 1, "one delivery, however many attempts");
+                assert.equal(deliveries[0].ok, false);
+                assert.equal(deliveries[0].status, 500);
+                assert.match(deliveries[0].error, /500/);
+
+                const [ after ] = await ok("forkstate_alerts", []);
+                assert.equal(after.failures, 1, "and the failure is counted against the alert");
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("stops and starts on demand", async () => {
+            const env = await newEnv({ name: "alert-toggle" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                const alert = await ok("forkstate_createAlert", [
+                    { name: "every block", url: hook.url, kind: "blocks" },
+                ]);
+                await ok("forkstate_setAlertActive", [ alert.id, false ]);
+                await ok("anvil_mine", [ "0x1" ]);
+                await new Promise((r) => setTimeout(r, 400));
+                assert.equal(hook.received.length, 0, "an alert that is off says nothing");
+
+                await ok("forkstate_setAlertActive", [ alert.id, true ]);
+                await ok("anvil_mine", [ "0x1" ]);
+                await hook.waitFor(1);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("sends one on demand, so a new alert can be seen to work", async () => {
+            const env = await newEnv({ name: "alert-test" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                const alert = await ok("forkstate_createAlert", [
+                    { name: "a test", url: hook.url, kind: "blocks" },
+                ]);
+                const delivery = await ok("forkstate_testAlert", [ alert.id ]);
+                assert.equal(delivery.ok, true);
+                assert.equal(hook.received[0]!.body.test, true);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("never hands the secret back after the first time", async () => {
+            const env = await newEnv({ name: "alert-secret" });
+            const ok = okFor(env.id);
+            const hook = await receiver();
+            try {
+                await ok("forkstate_createAlert", [
+                    { name: "quiet", url: hook.url, kind: "blocks" },
+                ]);
+                const listed = await ok("forkstate_alerts", []);
+                assert.equal(listed[0].secret, undefined);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("refuses an address only this engine can reach", async () => {
+            // A webhook is a request the server makes for the caller, which is
+            // the shape of every SSRF there has ever been.
+            const previous = process.env.FORKSTATE_ALERTS_ALLOW_LOCAL;
+            delete process.env.FORKSTATE_ALERTS_ALLOW_LOCAL;
+            try {
+                const env = await newEnv({ name: "alert-ssrf" });
+                const call = rpcFor(env.id);
+                for (const url of [
+                    "http://169.254.169.254/latest/meta-data/",
+                    "http://localhost:5432/",
+                    "http://10.0.0.5/hook",
+                    "http://192.168.1.1/hook",
+                    "http://metadata.google.internal/",
+                ]) {
+                    const answer = await call("forkstate_createAlert", [
+                        { name: "nope", url, kind: "blocks" },
+                    ]);
+                    assert.ok(answer.error, `${url} should have been refused`);
+                    assert.match(answer.error!.message, /not reachable from outside/);
+                }
+
+                const scheme = await call("forkstate_createAlert", [
+                    { name: "nope", url: "file:///etc/passwd", kind: "blocks" },
+                ]);
+                assert.match(scheme.error!.message, /http or https/);
+            } finally {
+                restoreEnv("FORKSTATE_ALERTS_ALLOW_LOCAL", previous);
+            }
+        });
+
+        it("keeps one testnet's alerts out of another's", async () => {
+            const mine = await newEnv({ name: "alert-mine" });
+            const theirs = await newEnv({ name: "alert-theirs" });
+            const hook = await receiver();
+            try {
+                const alert = await okFor(mine.id)("forkstate_createAlert", [
+                    { name: "mine", url: hook.url, kind: "blocks" },
+                ]);
+
+                assert.deepEqual(await okFor(theirs.id)("forkstate_alerts", []), [],
+                    "another testnet sees none of them");
+
+                // Knowing the id is not authority over it.
+                const stolen = await rpcFor(theirs.id)("forkstate_deleteAlert", [ alert.id ]);
+                assert.equal(stolen.result, false);
+                const peeked = await rpcFor(theirs.id)("forkstate_alertDeliveries", [ alert.id ]);
+                assert.match(peeked.error!.message, /No alert/);
+
+                assert.equal((await okFor(mine.id)("forkstate_alerts", [])).length, 1,
+                    "and it is still there");
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("takes the alerts with it when the environment is deleted", async () => {
+            const env = await newEnv({ name: "alert-cleanup" });
+            const hook = await receiver();
+            try {
+                await okFor(env.id)("forkstate_createAlert", [
+                    { name: "doomed", url: hook.url, kind: "blocks" },
+                ]);
+                await fetch(`${BASE}/environments/${env.id}`, { method: "DELETE" });
+                // An alert outliving its environment is a URL this engine would
+                // keep posting to for nothing.
+                assert.deepEqual(await store.listAlerts(env.id), []);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("refuses a rule that is not one", async () => {
+            const env = await newEnv({ name: "alert-bad" });
+            const call = rpcFor(env.id);
+            const hook = await receiver();
+            try {
+                assert.match(
+                    (await call("forkstate_createAlert", [ { name: "", url: hook.url, kind: "blocks" } ]))
+                        .error!.message, /needs a name/);
+                assert.match(
+                    (await call("forkstate_createAlert", [ { name: "x", url: hook.url, kind: "vibes" } ]))
+                        .error!.message, /logs, transactions or blocks/);
+            } finally {
+                hook.close();
+            }
         });
     });
 

@@ -15,6 +15,8 @@ import { UI } from "./ui.ts";
 import { limitsFromEnv, RateLimiter } from "./limits.ts";
 import { handleRpc } from "./rpc-server.ts";
 import { mutating, WriteQueue } from "./write-queue.ts";
+import type { Alerts } from "./alerts.ts";
+import type { StoredBlock, StoredTx } from "./chain.ts";
 import { serveSockets } from "./ws-server.ts";
 
 const MAX_BODY = 8 * 1024 * 1024;
@@ -80,7 +82,9 @@ class NoEnvironment extends Error {
 }
 
 
-export function serve(manager: Manager, port: number, defaultRpc: string, meter?: Meter) {
+export function serve(
+    manager: Manager, port: number, defaultRpc: string, meter?: Meter, alerts?: Alerts,
+) {
     const queue = new WriteQueue();
     // Off unless FORKSTATE_RATE says otherwise, so a local engine behaves the way
     // it always has and a deployed one can be given a ceiling.
@@ -181,9 +185,11 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
 
                     // Batches are how wallets and indexers actually talk; answering one
                     // at a time makes them look broken rather than slow.
+                    const context = { id, alerts };
                     const run = async (env: Environment) => (Array.isArray(payload)
-                        ? await Promise.all(payload.map((one) => handleRpc(env, one as Record<string, unknown>)))
-                        : await handleRpc(env, payload as Record<string, unknown>));
+                        ? await Promise.all(payload.map((one) =>
+                            handleRpc(env, one as Record<string, unknown>, context)))
+                        : await handleRpc(env, payload as Record<string, unknown>, context));
 
                     if (!mutating(payload)) {
                         // Reads change nothing, so they neither queue nor persist.
@@ -202,7 +208,23 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
                         const result = await queue.run(id, async () => {
                             const env = await manager.get(id);
                             if (!env) throw new NoEnvironment(id);
-                            const answer = await run(env);
+
+                            /*
+                             * Blocks are collected, not announced.
+                             *
+                             * An alert must describe something that happened. A
+                             * block that loses its write is thrown away, and a
+                             * webhook that had already gone out would be reporting
+                             * a transaction nobody can find.
+                             */
+                            const mined: Array<[ StoredBlock, StoredTx[] ]> = [];
+                            const stop = alerts ? env.watch((b, t) => { mined.push([ b, t ]); }) : null;
+                            let answer;
+                            try {
+                                answer = await run(env);
+                            } finally {
+                                stop?.();
+                            }
 
                             /*
                              * Only when something actually changed, and before the
@@ -211,6 +233,9 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
                              * receipt for a transaction that was thrown away.
                              */
                             await manager.persist(id, env);
+                            for (const [ block, txs ] of mined) {
+                                alerts!.dispatch(id, env.chainId, block, txs);
+                            }
                             return answer;
                         });
                         return send(res, 200, result);
@@ -251,7 +276,7 @@ export function serve(manager: Manager, port: number, defaultRpc: string, meter?
      * the middle of one sent over HTTP, and the same limiter, so a socket is a
      * cheaper way to ask rather than a free one.
      */
-    const websockets = serveSockets({ server, manager, key, limiter, meter, queue });
+    const websockets = serveSockets({ server, manager, key, limiter, meter, queue, alerts });
     server.on("close", () => websockets.close());
 
     server.listen(port);

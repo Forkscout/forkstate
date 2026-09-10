@@ -24,6 +24,7 @@ import { logMatches, type LogFilter } from "./logs.ts";
 import type { RateLimiter } from "./limits.ts";
 import type { Meter } from "./meter.ts";
 import { mutating, type WriteQueue } from "./write-queue.ts";
+import type { Alerts } from "./alerts.ts";
 import { StaleEnvironment } from "./manager.ts";
 
 /**
@@ -126,8 +127,9 @@ export function serveSockets(options: {
     meter?: Meter;
     /** The HTTP side's queue. Shared, or the two paths can write over each other. */
     queue: WriteQueue;
+    alerts?: Alerts;
 }): { close(): void } {
-    const { server, manager, key, limiter, meter, queue } = options;
+    const { server, manager, key, limiter, meter, queue, alerts } = options;
     const sockets = new WebSocketServer({ noServer: true, maxPayload: 4 * 1024 * 1024 });
 
     server.on("upgrade", (request: IncomingMessage, socket: Duplex, head: Buffer) => {
@@ -307,7 +309,8 @@ export function serveSockets(options: {
                     if (!mutating(request)) {
                         const live = await manager.get(id);
                         if (!live) return refuse(-32000, `No environment "${id}".`);
-                        return send(await handleRpc(live, request as Record<string, unknown>));
+                        return send(await handleRpc(live, request as Record<string, unknown>,
+                            { id, alerts }));
                     }
 
                     // Writes queue with the HTTP side's, and persist before the
@@ -316,8 +319,22 @@ export function serveSockets(options: {
                     const answer = await queue.run(id, async () => {
                         const live = await rewatch();
                         if (!live) throw new StaleEnvironment(id);
-                        const result = await handleRpc(live, request as Record<string, unknown>);
+                        // Collected and announced only after the write is out —
+                        // the same rule the HTTP side follows, and for the same
+                        // reason: an alert must describe something that happened.
+                        const mined: Array<[ StoredBlock, StoredTx[] ]> = [];
+                        const stop = alerts ? live.watch((b, t) => { mined.push([ b, t ]); }) : null;
+                        let result;
+                        try {
+                            result = await handleRpc(live, request as Record<string, unknown>,
+                                { id, alerts });
+                        } finally {
+                            stop?.();
+                        }
                         await manager.persist(id, live);
+                        for (const [ block, txs ] of mined) {
+                            alerts!.dispatch(id, live.chainId, block, txs);
+                        }
                         return result;
                     });
                     send(answer);

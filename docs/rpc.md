@@ -141,6 +141,59 @@ handshake. So the console signs one environment id and an expiry and appends
 `?exp=…&sig=…`; the engine checks it. The result is a URL that can be handed to
 a wallet: it opens one environment, cannot be edited into another, and expires.
 
+### Alerts
+
+A rule on this environment and a URL to post to when it matches. Same idea as a
+subscription, for a client that is not connected.
+
+| Method | Does |
+| --- | --- |
+| `forkstate_alerts` | Lists them. Never returns the secret |
+| `forkstate_createAlert` | Creates one; returns the secret **once** |
+| `forkstate_setAlertActive(id, on)` | Stops or restarts one |
+| `forkstate_deleteAlert(id)` | Removes it, and its history |
+| `forkstate_testAlert(id)` | Sends one now, so a new alert can be seen to work |
+| `forkstate_alertDeliveries(id, limit)` | The last 20 attempts, and why any failed |
+
+```json
+[{
+  "name": "big transfers",
+  "url": "https://example.com/hooks/forkstate",
+  "kind": "logs",
+  "criteria": { "address": "0x…", "topics": ["0xddf252ad…"] }
+}]
+```
+
+`kind` is `logs`, `transactions` or `blocks`. A `logs` rule takes the same
+`{ address, topics }` a subscription does. A `transactions` rule takes
+`{ from, to, status }`, where `status` is `failed`, `succeeded` or `any` —
+`failed` being the one most people are actually after. `blocks` takes nothing.
+
+One POST per alert per block, carrying every match in that block (up to 50, with
+`truncated: true` past that). The body is signed with the alert's secret:
+
+```
+x-forkstate-signature: sha256=<hmac-sha256 of the exact body>
+x-forkstate-alert: <alert id>
+```
+
+Compare against the raw bytes, not against re-serialised JSON.
+
+Alerts fire from blocks that were **written out**, never from blocks that were
+only mined: a replica that loses a write throws its block away, and a webhook
+that had already gone out would be describing a transaction nobody can find.
+Delivery never blocks the transaction that caused it.
+
+Three attempts, a second apart, then it is recorded as failed. Twenty
+consecutive failures switches the alert off — the rule stays, with the reason
+beside it, and `forkstate_setAlertActive` turns it back on.
+
+A URL that only this engine can reach — `localhost`, `10.x`, `169.254.169.254`,
+`*.internal` — is refused, because a webhook is a request the server makes on
+the caller's behalf. A self-hosted engine can allow them with
+`FORKSTATE_ALERTS_ALLOW_LOCAL=1`; that is the operator's decision, never the
+caller's.
+
 ### Cheatcodes
 
 `anvil_setBalance`, `anvil_setNonce`, `anvil_setCode`, `anvil_setStorageAt`,

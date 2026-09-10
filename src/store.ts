@@ -119,6 +119,14 @@ export class Store {
         return this.backend.loadTrace(envId, hash);
     }
 
+    async listAlerts(envId: string) {
+        return this.backend.listAlerts(envId);
+    }
+
+    async deleteAlerts(envId: string): Promise<void> {
+        await this.backend.deleteAlerts(envId);
+    }
+
     async deleteTraces(envId: string): Promise<void> {
         await this.backend.deleteTraces(envId);
     }

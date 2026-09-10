@@ -12,6 +12,7 @@ import { bytesToHex, hexToBytes } from "@ethereumjs/util";
 import type { BundleOptions, CallRequest, Environment, StateOverrides } from "./environment.ts";
 import { submitVerification, verificationStatus, type VerifyRequest } from "./verify.ts";
 import type { StoredBlock, StoredTx } from "./chain.ts";
+import { checkUrl, type Alerts, type Criteria } from "./alerts.ts";
 import type { Log } from "./types.ts";
 
 interface RpcRequest {
@@ -22,6 +23,14 @@ interface RpcRequest {
 }
 
 const hex = (value: bigint | number): string => "0x" + BigInt(value).toString(16);
+
+/** Alerts need somewhere to live; an engine with no store has nowhere. */
+function needAlerts(context?: RpcContext): Alerts {
+    if (!context?.alerts) {
+        throw new Error("This engine is not storing alerts.");
+    }
+    return context.alerts;
+}
 
 /** Where downloaded compilers are kept; beside the overlay database by default. */
 const SOLC_DIR = process.env.FORKSTATE_SOLC_DIR ?? "./data/solc";
@@ -34,6 +43,8 @@ const NEVER_FORWARD = new Set([
     "forkstate_sync", "forkstate_followHead", "forkstate_setTokenBalance", "forkstate_contracts",
     "forkstate_setChainId", "forkstate_verify", "forkstate_verifyStatus",
     "forkstate_simulateBundle",
+    "forkstate_alerts", "forkstate_createAlert", "forkstate_deleteAlert",
+    "forkstate_setAlertActive", "forkstate_testAlert", "forkstate_alertDeliveries",
 ]);
 
 /**
@@ -206,7 +217,21 @@ function toHeight(env: Environment, tag: unknown): number {
     return Number(BigInt(String(tag)));
 }
 
-export async function handleRpc(env: Environment, request: RpcRequest): Promise<unknown> {
+/**
+ * What the environment itself cannot answer for.
+ *
+ * An environment does not know its own id — that belongs to the manager that
+ * handed it out — and alerts are stored under it. Passed in rather than looked
+ * up, so nothing here has to reach back into the server that called it.
+ */
+export interface RpcContext {
+    id: string;
+    alerts?: Alerts;
+}
+
+export async function handleRpc(
+    env: Environment, request: RpcRequest, context?: RpcContext,
+): Promise<unknown> {
     const method = String(request.method ?? "");
     const params = (request.params ?? []) as unknown[];
     const reply = (result: unknown) => ({ jsonrpc: "2.0", id: request.id ?? null, result });
@@ -591,6 +616,53 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
                 return reply(found);
             }
             // Contracts the overlay owns: deployed here, or code set by a cheatcode.
+            // ---- alerts
+            /*
+             * Addressed through the environment, always.
+             *
+             * An alert id alone is not authority over an alert: every one of
+             * these takes the environment from the path it arrived on, so
+             * knowing an id is not enough to read or delete somebody else's.
+             */
+            case "forkstate_alerts": {
+                const alerts = needAlerts(context);
+                return reply(await alerts.list(context!.id));
+            }
+            case "forkstate_createAlert": {
+                const alerts = needAlerts(context);
+                const input = (params[0] ?? {}) as {
+                    name?: string; url?: string; kind?: string; criteria?: Criteria;
+                };
+                return reply(await alerts.create(context!.id, {
+                    name: String(input.name ?? ""),
+                    // Checked here as well, so the message about a private
+                    // address arrives before anything is stored.
+                    url: checkUrl(String(input.url ?? "")).toString(),
+                    kind: String(input.kind ?? "logs") as "logs" | "transactions" | "blocks",
+                    criteria: input.criteria,
+                }));
+            }
+            case "forkstate_deleteAlert": {
+                const alerts = needAlerts(context);
+                return reply(await alerts.delete(context!.id, String(params[0] ?? "")));
+            }
+            case "forkstate_setAlertActive": {
+                const alerts = needAlerts(context);
+                return reply(await alerts.setActive(
+                    context!.id, String(params[0] ?? ""), params[1] !== false,
+                ));
+            }
+            case "forkstate_testAlert": {
+                const alerts = needAlerts(context);
+                return reply(await alerts.test(context!.id, String(params[0] ?? "")));
+            }
+            case "forkstate_alertDeliveries": {
+                const alerts = needAlerts(context);
+                return reply(await alerts.deliveries(
+                    context!.id, String(params[0] ?? ""), Number(params[1] ?? 20),
+                ));
+            }
+
             case "forkstate_contracts": return reply(env.deployedContracts());
             case "forkstate_followHead": {
                 env.followsHead = params[0] === undefined ? true : Boolean(params[0]);

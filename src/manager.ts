@@ -183,6 +183,9 @@ export class Manager {
         // The traces go with it. Left behind they would be unreachable rows that
         // nothing ever deletes, growing for the life of the database.
         await this.store.deleteTraces(id);
+        // So do the alerts, and for a second reason: an alert outliving its
+        // environment is a URL this engine would keep posting to for nothing.
+        await this.store.deleteAlerts(id);
         return this.store.delete(id);
     }
 

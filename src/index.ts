@@ -10,6 +10,7 @@ import { Manager } from "./manager.ts";
 import { Meter } from "./meter.ts";
 import { Store } from "./store.ts";
 import { openBackend } from "./backend.ts";
+import { Alerts } from "./alerts.ts";
 import { UpstreamCache } from "./upstream-cache.ts";
 import { serve } from "./server.ts";
 
@@ -80,7 +81,7 @@ if (!(await manager.get("default"))) {
     });
 }
 
-serve(manager, PORT, RPC, meter);
+serve(manager, PORT, RPC, meter, new Alerts(backend));
 
 const preset = await manager.get("default");
 console.log(`forkstate on http://127.0.0.1:${PORT}`);

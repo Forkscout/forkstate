@@ -41,6 +41,35 @@ export interface SavedRow {
     revision: number;
 }
 
+/** A rule someone set on an environment, and where to tell them about it. */
+export interface AlertRow {
+    id: string;
+    envId: string;
+    name: string;
+    url: string;
+    /** Signs the body, so the receiver can tell this from anyone who found the URL. */
+    secret: string;
+    kind: "logs" | "transactions" | "blocks";
+    /** JSON, shaped by the kind. */
+    criteria: string;
+    active: boolean;
+    createdAt: number;
+    lastFiredAt: number | null;
+    /** Consecutive failures. Reset by a success; enough of them turns the alert off. */
+    failures: number;
+}
+
+/** One attempt to tell somebody, kept so they can see why it did not arrive. */
+export interface DeliveryRow {
+    id: string;
+    alertId: string;
+    at: number;
+    ok: boolean;
+    status: number | null;
+    error: string | null;
+    matches: number;
+}
+
 export interface Backend {
     loadEnvironment(id: string): Promise<SavedRow | null>;
     /**
@@ -67,6 +96,20 @@ export interface Backend {
     saveTrace(envId: string, hash: string, trace: string, diff: string): Promise<void>;
     loadTrace(envId: string, hash: string): Promise<{ trace: string; diff: string } | null>;
     deleteTraces(envId: string): Promise<void>;
+
+    /**
+     * Alerts, and what happened when they last fired.
+     *
+     * Kept beside the environment rather than inside its row: the row is
+     * rewritten on every block, and a rule someone typed once should not be
+     * re-serialised a thousand times a day to sit still.
+     */
+    listAlerts(envId: string): Promise<AlertRow[]>;
+    saveAlert(row: AlertRow): Promise<void>;
+    deleteAlert(envId: string, id: string): Promise<boolean>;
+    deleteAlerts(envId: string): Promise<void>;
+    recordDelivery(row: DeliveryRow): Promise<void>;
+    listDeliveries(alertId: string, limit: number): Promise<DeliveryRow[]>;
 
     cacheGet(key: string): Promise<string | null>;
     /** Written in one round trip: a cold call misses dozens of keys at once. */
@@ -113,7 +156,59 @@ CREATE TABLE IF NOT EXISTS usage (
     misses   INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (env_id, day)
 );
+CREATE TABLE IF NOT EXISTS alerts (
+    id           TEXT PRIMARY KEY,
+    env_id       TEXT NOT NULL,
+    name         TEXT NOT NULL,
+    url          TEXT NOT NULL,
+    secret       TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    criteria     TEXT NOT NULL,
+    active       INTEGER NOT NULL DEFAULT 1,
+    created_at   INTEGER NOT NULL,
+    last_fired_at INTEGER,
+    failures     INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS alerts_env ON alerts (env_id);
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    id       TEXT PRIMARY KEY,
+    alert_id TEXT NOT NULL,
+    at       INTEGER NOT NULL,
+    ok       INTEGER NOT NULL,
+    status   INTEGER,
+    error    TEXT,
+    matches  INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS alert_deliveries_alert ON alert_deliveries (alert_id, at DESC);
 `;
+
+const toAlert = (row: Record<string, unknown>): AlertRow => ({
+    id: String(row.id),
+    envId: String(row.env_id),
+    name: String(row.name),
+    url: String(row.url),
+    secret: String(row.secret),
+    kind: String(row.kind) as AlertRow["kind"],
+    criteria: String(row.criteria),
+    active: row.active === true || Number(row.active) === 1,
+    createdAt: Number(row.created_at),
+    lastFiredAt: row.last_fired_at === null || row.last_fired_at === undefined
+        ? null : Number(row.last_fired_at),
+    failures: Number(row.failures ?? 0),
+});
+
+const toDelivery = (row: Record<string, unknown>): DeliveryRow => ({
+    id: String(row.id),
+    alertId: String(row.alert_id),
+    at: Number(row.at),
+    ok: row.ok === true || Number(row.ok) === 1,
+    status: row.status === null || row.status === undefined ? null : Number(row.status),
+    error: row.error === null || row.error === undefined ? null : String(row.error),
+    matches: Number(row.matches ?? 0),
+});
+
+/** Deliveries older than this many, per alert, are dropped as new ones arrive. */
+const DELIVERIES_KEPT = 20;
 
 const fromSqlite = (row: Record<string, unknown>): SavedRow => ({
     revision: Number(row.revision ?? 0),
@@ -220,6 +315,58 @@ class SqliteBackend implements Backend {
         this.db.prepare("DELETE FROM traces WHERE env_id = ?").run(envId);
     }
 
+    async listAlerts(envId: string) {
+        return (this.db.prepare(
+            "SELECT * FROM alerts WHERE env_id = ? ORDER BY created_at DESC").all(envId) as
+            Array<Record<string, unknown>>).map(toAlert);
+    }
+
+    async saveAlert(row: AlertRow) {
+        this.db.prepare(`
+            INSERT INTO alerts
+                (id, env_id, name, url, secret, kind, criteria, active, created_at,
+                 last_fired_at, failures)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name, url = excluded.url, kind = excluded.kind,
+                criteria = excluded.criteria, active = excluded.active,
+                last_fired_at = excluded.last_fired_at, failures = excluded.failures`)
+            .run(row.id, row.envId, row.name, row.url, row.secret, row.kind, row.criteria,
+                row.active ? 1 : 0, row.createdAt, row.lastFiredAt, row.failures);
+    }
+
+    async deleteAlert(envId: string, id: string) {
+        const gone = this.db.prepare("DELETE FROM alerts WHERE env_id = ? AND id = ?")
+            .run(envId, id);
+        this.db.prepare("DELETE FROM alert_deliveries WHERE alert_id = ?").run(id);
+        return Number(gone.changes) > 0;
+    }
+
+    async deleteAlerts(envId: string) {
+        this.db.prepare(
+            "DELETE FROM alert_deliveries WHERE alert_id IN (SELECT id FROM alerts WHERE env_id = ?)")
+            .run(envId);
+        this.db.prepare("DELETE FROM alerts WHERE env_id = ?").run(envId);
+    }
+
+    async recordDelivery(row: DeliveryRow) {
+        this.db.prepare(`
+            INSERT INTO alert_deliveries (id, alert_id, at, ok, status, error, matches)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`)
+            .run(row.id, row.alertId, row.at, row.ok ? 1 : 0, row.status, row.error, row.matches);
+        // Trimmed here rather than by a sweep: this is the only place rows arrive.
+        this.db.prepare(`
+            DELETE FROM alert_deliveries WHERE alert_id = ? AND id NOT IN (
+                SELECT id FROM alert_deliveries WHERE alert_id = ? ORDER BY at DESC LIMIT ?)`)
+            .run(row.alertId, row.alertId, DELIVERIES_KEPT);
+    }
+
+    async listDeliveries(alertId: string, limit: number) {
+        return (this.db.prepare(
+            "SELECT * FROM alert_deliveries WHERE alert_id = ? ORDER BY at DESC LIMIT ?")
+            .all(alertId, limit) as Array<Record<string, unknown>>).map(toDelivery);
+    }
+
     async cacheGet(key: string) {
         const row = this.db.prepare("SELECT value FROM upstream WHERE key = ?").get(key) as
             { value: string } | undefined;
@@ -248,7 +395,7 @@ class SqliteBackend implements Backend {
 const SCHEMA_LOCK = 8_314_206;
 
 /** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const POSTGRES_SCHEMA = `
 CREATE TABLE IF NOT EXISTS traces (
@@ -293,6 +440,30 @@ CREATE TABLE IF NOT EXISTS upstream (
     value text NOT NULL,
     seen  bigint NOT NULL
 );
+CREATE TABLE IF NOT EXISTS alerts (
+    id            text PRIMARY KEY,
+    env_id        text NOT NULL,
+    name          text NOT NULL,
+    url           text NOT NULL,
+    secret        text NOT NULL,
+    kind          text NOT NULL,
+    criteria      text NOT NULL,
+    active        boolean NOT NULL DEFAULT true,
+    created_at    bigint NOT NULL,
+    last_fired_at bigint,
+    failures      int NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS alerts_env ON alerts (env_id);
+CREATE TABLE IF NOT EXISTS alert_deliveries (
+    id       text PRIMARY KEY,
+    alert_id text NOT NULL,
+    at       bigint NOT NULL,
+    ok       boolean NOT NULL,
+    status   int,
+    error    text,
+    matches  int NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS alert_deliveries_alert ON alert_deliveries (alert_id, at DESC);
 `;
 
 const fromPostgres = (row: Record<string, unknown>): SavedRow => ({
@@ -441,6 +612,58 @@ class PostgresBackend implements Backend {
 
     async deleteTraces(envId: string) {
         await this.sql`DELETE FROM traces WHERE env_id = ${envId}`;
+    }
+
+    async listAlerts(envId: string) {
+        const rows = await this.sql`
+            SELECT * FROM alerts WHERE env_id = ${envId} ORDER BY created_at DESC`;
+        return rows.map(toAlert);
+    }
+
+    async saveAlert(row: AlertRow) {
+        await this.sql`
+            INSERT INTO alerts
+                (id, env_id, name, url, secret, kind, criteria, active, created_at,
+                 last_fired_at, failures)
+            VALUES (${row.id}, ${row.envId}, ${row.name}, ${row.url}, ${row.secret},
+                    ${row.kind}, ${row.criteria}, ${row.active}, ${row.createdAt},
+                    ${row.lastFiredAt}, ${row.failures})
+            ON CONFLICT (id) DO UPDATE SET
+                name = EXCLUDED.name, url = EXCLUDED.url, kind = EXCLUDED.kind,
+                criteria = EXCLUDED.criteria, active = EXCLUDED.active,
+                last_fired_at = EXCLUDED.last_fired_at, failures = EXCLUDED.failures`;
+    }
+
+    async deleteAlert(envId: string, id: string) {
+        await this.sql`DELETE FROM alert_deliveries WHERE alert_id = ${id}`;
+        const gone = await this.sql`DELETE FROM alerts WHERE env_id = ${envId} AND id = ${id}`;
+        return gone.count > 0;
+    }
+
+    async deleteAlerts(envId: string) {
+        await this.sql`
+            DELETE FROM alert_deliveries
+            WHERE alert_id IN (SELECT id FROM alerts WHERE env_id = ${envId})`;
+        await this.sql`DELETE FROM alerts WHERE env_id = ${envId}`;
+    }
+
+    async recordDelivery(row: DeliveryRow) {
+        await this.sql`
+            INSERT INTO alert_deliveries (id, alert_id, at, ok, status, error, matches)
+            VALUES (${row.id}, ${row.alertId}, ${row.at}, ${row.ok}, ${row.status},
+                    ${row.error}, ${row.matches})`;
+        // Trimmed here rather than by a sweep: this is the only place rows arrive.
+        await this.sql`
+            DELETE FROM alert_deliveries WHERE alert_id = ${row.alertId} AND id NOT IN (
+                SELECT id FROM alert_deliveries WHERE alert_id = ${row.alertId}
+                ORDER BY at DESC LIMIT ${DELIVERIES_KEPT})`;
+    }
+
+    async listDeliveries(alertId: string, limit: number) {
+        const rows = await this.sql`
+            SELECT * FROM alert_deliveries WHERE alert_id = ${alertId}
+            ORDER BY at DESC LIMIT ${limit}`;
+        return rows.map(toDelivery);
     }
 
     async cacheGet(key: string) {
