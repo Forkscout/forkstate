@@ -510,13 +510,33 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
             }
             // Give an address a token balance by finding the slot the token uses.
             case "forkstate_setTokenBalance": {
+                const token = String(params[0]);
+
+                /*
+                 * Whether there is a contract there at all, before blaming its
+                 * layout.
+                 *
+                 * The search fails the same way for a token with an unusual
+                 * layout and for an address that is not a token — an ordinary
+                 * account, or the holder typed into the wrong box, which is the
+                 * likelier of the two. Saying "its layout could not be probed"
+                 * about an address with no code sends people looking at the
+                 * token when the problem is the address.
+                 */
+                if (await env.getCode(token) === "0x") {
+                    return fail(
+                        `There is no contract at ${token} on this fork, so it cannot be a token. `
+                        + "Check the address — the token and the holder are easy to swap.",
+                    );
+                }
+
                 const found = await env.setTokenBalance(
-                    String(params[0]), String(params[1]), BigInt(String(params[2])),
+                    token, String(params[1]), BigInt(String(params[2])),
                 );
                 if (!found) {
                     return fail(
-                        "Could not find where this token keeps balances. It may use a layout "
-                        + "this does not probe, or a proxy that stores them elsewhere.",
+                        `Could not find where ${token} keeps balances. It may use a layout this `
+                        + "does not probe, or be a proxy that stores them elsewhere.",
                     );
                 }
                 return reply(found);

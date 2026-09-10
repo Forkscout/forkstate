@@ -1114,6 +1114,36 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("setting a token balance", () => {
+        it("says there is no contract there, rather than blaming the layout", async () => {
+            /*
+             * The two failures look identical from inside the search: a token
+             * with an unusual layout, and an address that is not a token at all.
+             * The second is much likelier — the token and the holder sit next to
+             * each other in a form — and reporting it as the first sends people
+             * to read the token's source when the address is what is wrong.
+             */
+            const env = await newEnv({ name: "token-not-a-token" });
+            const ok = okFor(env.id);
+            await assert.rejects(
+                () => ok("forkstate_setTokenBalance", [ DEAD, HOLDER, "0x1" ]),
+                /no contract at/,
+                "an address with no code is not a layout problem",
+            );
+        });
+
+        it("still finds a real token's balances", async () => {
+            const env = await newEnv({ name: "token-real" });
+            const ok = okFor(env.id);
+            const wanted = 1_000n * 10n ** 18n;
+            await ok("forkstate_setTokenBalance", [ USDT, HOLDER, "0x" + wanted.toString(16) ]);
+
+            const held = BigInt(await ok("eth_call", [
+                { to: USDT, data: "0x70a08231" + pad(HOLDER) }, "latest" ]));
+            assert.equal(held, wanted);
+        });
+    });
+
     describe("the healthcheck", () => {
         it("answers without a key, and says nothing else", async () => {
             // Every other endpoint needs the header, so a deployment with a key
