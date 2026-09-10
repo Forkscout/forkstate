@@ -669,13 +669,17 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
 
         // Searching 64 slots against a remote parent is slower than the default.
         it("leaves nothing behind when it cannot find the slot", { timeout: 30_000 }, async () => {
+            // A real contract that is not a token, so the search actually runs
+            // and fails on the layout rather than on there being no code — those
+            // are different failures and only this one is about the probes.
             const env = await newEnv({ name: "faucet-miss" });
             const ok = okFor(env.id);
             const before = (await ok("forkstate_info", [])).size.slots;
 
-            const attempt = await rpcFor(env.id)("forkstate_setTokenBalance", [ DEAD, SIGNER, "1" ]);
+            const attempt = await rpcFor(env.id)("forkstate_setTokenBalance", [ ROUTER, SIGNER, "1" ]);
             assert.match(attempt.error!.message, /Could not find/);
-            assert.equal((await ok("forkstate_info", [])).size.slots, before);
+            assert.equal((await ok("forkstate_info", [])).size.slots, before,
+                "a failed search must put every slot back as it found it");
         });
     });
 
