@@ -822,6 +822,235 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("simulating a bundle", () => {
+        const balanceOf = (who: string) => "0x70a08231" + pad(who);
+        /** `transfer(to, amount)` */
+        const transfer = (to: string, amount: bigint) => "0xa9059cbb" + pad(to) + word(amount);
+        /** `approve(spender, amount)` */
+        const approve = (who: string, amount: bigint) => "0x095ea7b3" + pad(who) + word(amount);
+        /** `allowance(owner, spender)` */
+        const allowance = (owner: string, spender: string) =>
+            "0xdd62ed3e" + pad(owner) + pad(spender);
+
+        it("lets the second transaction see what the first one did", async () => {
+            // The entire point. Two eth_calls cannot answer this, because the
+            // approve is gone by the time the allowance is read.
+            const env = await newEnv({ name: "bundle-sequence" });
+            const ok = okFor(env.id);
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                transactions: [
+                    { from: HOLDER, to: USDT, data: approve(ROUTER, 5n) },
+                    { from: HOLDER, to: USDT, data: allowance(HOLDER, ROUTER) },
+                ],
+            }]);
+
+            assert.equal(bundle.failed, false);
+            assert.equal(bundle.results.length, 2);
+            assert.equal(bundle.results[0].status, 1);
+            assert.equal(BigInt(bundle.results[1].returnValue), 5n,
+                "the second transaction should read the first one's approval");
+        });
+
+        it("leaves the fork exactly as it found it", async () => {
+            const env = await newEnv({ name: "bundle-clean" });
+            const ok = okFor(env.id);
+
+            const before = BigInt(await ok("eth_call", [
+                { to: USDT, data: allowance(HOLDER, ROUTER) }, "latest",
+            ]));
+            const height = await ok("eth_blockNumber", []);
+
+            await ok("forkstate_simulateBundle", [{
+                transactions: [ { from: HOLDER, to: USDT, data: approve(ROUTER, 77n) } ],
+            }]);
+
+            assert.equal(BigInt(await ok("eth_call", [
+                { to: USDT, data: allowance(HOLDER, ROUTER) }, "latest",
+            ])), before, "the approval must not have survived the simulation");
+            assert.equal(await ok("eth_blockNumber", []), height, "and no block should be mined");
+            assert.equal((await ok("forkstate_info", [])).size.slots, 0,
+                "and nothing should have reached the overlay");
+        });
+
+        it("keeps going after one reverts, and says which", async () => {
+            const env = await newEnv({ name: "bundle-revert" });
+            const ok = okFor(env.id);
+            const BROKE = "0x000000000000000000000000000000000000b0b0";
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                transactions: [
+                    { from: HOLDER, to: USDT, data: approve(ROUTER, 3n) },
+                    // Nobody holds this much of anything.
+                    { from: BROKE, to: USDT, data: transfer(DEAD, 10n ** 30n) },
+                    { from: HOLDER, to: USDT, data: allowance(HOLDER, ROUTER) },
+                ],
+            }]);
+
+            assert.equal(bundle.failed, true, "one of them failed, so the bundle did");
+            assert.equal(bundle.results[0].status, 1);
+            assert.equal(bundle.results[1].status, 0);
+            assert.ok(bundle.results[1].error, "a failure should say why");
+            assert.equal(bundle.results[2].status, 1,
+                "the third should still have run");
+            assert.equal(BigInt(bundle.results[2].returnValue), 3n,
+                "and should still see the first one's approval, not the failure's writes");
+        });
+
+        it("undoes a reverted transaction without undoing the ones before it", async () => {
+            const env = await newEnv({ name: "bundle-rollback" });
+            const ok = okFor(env.id);
+            const REVERTS = "0x000000000000000000000000000000000000dEa1";
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                overrides: {
+                    // SSTORE 1 -> 1, then revert. The write must not be visible.
+                    [REVERTS]: { code: "0x600160015560006000fd" },
+                },
+                transactions: [
+                    { from: HOLDER, to: REVERTS, data: "0x" },
+                    { from: HOLDER, to: USDT, data: balanceOf(HOLDER) },
+                ],
+            }]);
+
+            assert.equal(bundle.results[0].status, 0);
+            assert.equal(bundle.results[1].status, 1, "the bundle should carry on");
+            assert.equal(await ok("eth_getStorageAt", [ REVERTS, "0x1", "latest" ]),
+                "0x" + "0".repeat(64), "and the reverted write must be nowhere");
+        });
+
+        it("starts from the state the overrides describe", async () => {
+            // "What would this do if I held a million USDT?" — asked about a
+            // sequence rather than a single call.
+            const env = await newEnv({ name: "bundle-overrides" });
+            const ok = okFor(env.id);
+            const POOR = "0x0000000000000000000000000000000000000f00";
+            const pretend = 1_000_000n * 10n ** 18n;
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                overrides: {
+                    [USDT]: { stateDiff: { [balanceSlot(POOR, 1n)]: "0x" + pretend.toString(16) } },
+                },
+                transactions: [
+                    { from: POOR, to: USDT, data: transfer(DEAD, 1000n) },
+                    { from: POOR, to: USDT, data: balanceOf(POOR) },
+                ],
+            }]);
+
+            assert.equal(bundle.failed, false, "the transfer should have the balance to make");
+            assert.equal(BigInt(bundle.results[1].returnValue), pretend - 1000n,
+                "and the balance afterwards should be the pretended one, less what moved");
+        });
+
+        it("reports the logs each transaction emitted", async () => {
+            const env = await newEnv({ name: "bundle-logs" });
+            const ok = okFor(env.id);
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                transactions: [ { from: HOLDER, to: USDT, data: approve(ROUTER, 9n) } ],
+            }]);
+
+            const logs = bundle.results[0].logs;
+            assert.equal(logs.length, 1, "approve emits one Approval");
+            assert.equal(logs[0].address.toLowerCase(), USDT.toLowerCase());
+            // keccak("Approval(address,address,uint256)")
+            assert.equal(logs[0].topics[0],
+                "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925");
+        });
+
+        it("traces and diffs only when asked", async () => {
+            const env = await newEnv({ name: "bundle-detail" });
+            const ok = okFor(env.id);
+            const transactions = [ { from: HOLDER, to: USDT, data: approve(ROUTER, 11n) } ];
+
+            const plain = await ok("forkstate_simulateBundle", [{ transactions }]);
+            assert.equal(plain.results[0].callTree, undefined);
+            assert.equal(plain.results[0].stateDiff, undefined);
+
+            const full = await ok("forkstate_simulateBundle", [
+                { transactions, trace: true, diff: true },
+            ]);
+            assert.equal(full.results[0].callTree.to.toLowerCase(), USDT.toLowerCase());
+            assert.ok(Object.keys(full.results[0].stateDiff.storage).length > 0,
+                "an approve writes a slot, so the diff should show one");
+        });
+
+        it("does not report state changes for a transaction that reverted", async () => {
+            const env = await newEnv({ name: "bundle-nodiff" });
+            const ok = okFor(env.id);
+            const REVERTS = "0x000000000000000000000000000000000000dEa2";
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                overrides: { [REVERTS]: { code: "0x600160015560006000fd" } },
+                transactions: [ { from: HOLDER, to: REVERTS, data: "0x" } ],
+                diff: true,
+                trace: true,
+            }]);
+
+            assert.equal(bundle.results[0].status, 0);
+            assert.equal(bundle.results[0].stateDiff, undefined,
+                "the write was undone, so it is not a state change");
+            assert.ok(bundle.results[0].callTree, "the trace is where you see what it tried");
+        });
+
+        it("advances the sender's nonce between transactions", async () => {
+            // A deployment's address comes from the sender and nonce, so two
+            // creations in one bundle must not land on the same address.
+            const env = await newEnv({ name: "bundle-nonce" });
+            const ok = okFor(env.id);
+
+            const bundle = await ok("forkstate_simulateBundle", [{
+                transactions: [
+                    { from: HOLDER, data: CREATION, gas: "0x500000" },
+                    { from: HOLDER, data: CREATION, gas: "0x500000" },
+                ],
+            }]);
+
+            const [ first, second ] = bundle.results;
+            assert.equal(first.status, 1);
+            assert.equal(second.status, 1);
+            assert.ok(first.contractAddress, "a creation should report where it landed");
+            assert.notEqual(first.contractAddress, second.contractAddress,
+                "two creations from one sender cannot share an address");
+        });
+
+        it("accepts a bare array of transactions", async () => {
+            const env = await newEnv({ name: "bundle-array" });
+            const ok = okFor(env.id);
+            const bundle = await ok("forkstate_simulateBundle", [
+                [ { from: HOLDER, to: USDT, data: balanceOf(HOLDER) } ],
+            ]);
+            assert.equal(bundle.results.length, 1);
+            assert.equal(bundle.results[0].status, 1);
+        });
+
+        it("refuses a bundle that is empty or absurd", async () => {
+            const env = await newEnv({ name: "bundle-limits" });
+            const call = rpcFor(env.id);
+
+            assert.match((await call("forkstate_simulateBundle", [{ transactions: [] }])).error!.message,
+                /at least one/);
+            assert.match((await call("forkstate_simulateBundle", [{}])).error!.message,
+                /array of transactions/);
+
+            const many = Array.from({ length: 65 }, () => ({ from: HOLDER, to: DEAD }));
+            assert.match(
+                (await call("forkstate_simulateBundle", [{ transactions: many }])).error!.message,
+                /64 transactions/,
+            );
+        });
+
+        it("is never forwarded to the parent chain", async () => {
+            // The parent has no idea what this method is, and a forwarded one
+            // would come back as the parent's error rather than ours.
+            const env = await newEnv({ name: "bundle-noforward" });
+            const call = rpcFor(env.id);
+            const answer = await call("forkstate_simulateBundle", [{ transactions: [] }]);
+            assert.ok(answer.error, "it should fail here, with our message");
+            assert.match(answer.error!.message, /bundle/);
+        });
+    });
+
     describe("two replicas on one store", () => {
         /*
          * A second manager over the same store is what a second replica is.

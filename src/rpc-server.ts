@@ -9,7 +9,7 @@
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { bytesToHex, hexToBytes } from "@ethereumjs/util";
 
-import type { Environment, StateOverrides } from "./environment.ts";
+import type { BundleOptions, CallRequest, Environment, StateOverrides } from "./environment.ts";
 import { submitVerification, verificationStatus, type VerifyRequest } from "./verify.ts";
 import type { StoredBlock, StoredTx } from "./chain.ts";
 import type { Log } from "./types.ts";
@@ -33,6 +33,7 @@ const NEVER_FORWARD = new Set([
     "eth_uninstallFilter", "eth_newPendingTransactionFilter",
     "forkstate_sync", "forkstate_followHead", "forkstate_setTokenBalance", "forkstate_contracts",
     "forkstate_setChainId", "forkstate_verify", "forkstate_verifyStatus",
+    "forkstate_simulateBundle",
 ]);
 
 /**
@@ -265,6 +266,48 @@ export async function handleRpc(env: Environment, request: RpcRequest): Promise<
                 const result = await env.call(call, params[2] as StateOverrides | undefined);
                 if (result.reverted) return fail(result.error ?? "execution reverted", 3);
                 return reply(result.returnValue);
+            }
+            /*
+             * Several transactions, in order, against one another's results.
+             *
+             * The parameters are accepted in either shape a caller is likely to
+             * reach for — an array of transactions, or an object with them under
+             * "transactions" alongside the options — because there is no standard
+             * for this method and guessing wrong costs a round trip.
+             */
+            case "forkstate_simulateBundle": {
+                const first = params[0];
+                const bundle = Array.isArray(first)
+                    ? { transactions: first, ...(params[1] as BundleOptions ?? {}) }
+                    : (first ?? {}) as { transactions?: unknown } & BundleOptions;
+                const transactions = bundle.transactions;
+                if (!Array.isArray(transactions)) {
+                    return fail(
+                        "forkstate_simulateBundle takes an array of transactions, or an object "
+                        + "with them under \"transactions\"",
+                        -32602,
+                    );
+                }
+                const simulated = await env.simulateBundle(transactions as CallRequest[], {
+                    overrides: bundle.overrides,
+                    trace: Boolean(bundle.trace),
+                    diff: Boolean(bundle.diff),
+                });
+                /*
+                 * Reshaped to match what `debug_trace*` already answers with.
+                 *
+                 * A caller that can render one trace should be able to render
+                 * these without learning a second shape, and the console's trace
+                 * view reads exactly these names.
+                 */
+                return reply({
+                    ...simulated,
+                    results: simulated.results.map(({ trace, diff, ...rest }) => ({
+                        ...rest,
+                        ...(trace ? { callTree: trace.root, truncated: trace.truncated } : {}),
+                        ...(diff ? { stateDiff: diff } : {}),
+                    })),
+                });
             }
             case "eth_estimateGas": {
                 const call = params[0] as Record<string, string>;

@@ -74,6 +74,39 @@ asked for".
 
 Traces are kept beside the environment, so they survive a restart.
 
+### Simulating several transactions at once
+
+`forkstate_simulateBundle` runs transactions in order, each on top of what the
+one before it did, and throws all of it away. An approve followed by a swap is
+two `eth_call`s that fail separately and one bundle that works.
+
+```json
+[{
+  "transactions": [
+    { "from": "0x…", "to": "0xUSDT", "data": "0x095ea7b3…" },
+    { "from": "0x…", "to": "0xRouter", "data": "0x38ed1739…" }
+  ],
+  "overrides": { "0xUSDT": { "stateDiff": { "0x…": "0x…" } } },
+  "trace": true,
+  "diff": true
+}]
+```
+
+A bare array of transactions works too. `overrides` are applied once, before the
+first transaction, and are the same shape `eth_call` takes.
+
+Each result carries `index`, `from`, `to`, `status`, `gasUsed`, `returnValue`,
+`error`, `revertData`, `contractAddress` and `logs`; `trace` adds `callTree`,
+`diff` adds `stateDiff`, both under the names `debug_traceTransaction` uses.
+The bundle itself reports total `gasUsed` and whether any transaction `failed`.
+
+One that reverts is undone on its own — the ones before it stand, and the ones
+after it still run, so a caller who sent five transactions hears about five. A
+reverted transaction still spends its nonce, as it would on a chain, and gets no
+`stateDiff`, because its writes were undone; its `callTree` is where you see
+what it tried. Nothing is mined and nothing reaches the overlay. Up to 64
+transactions per bundle.
+
 ### Cheatcodes
 
 `anvil_setBalance`, `anvil_setNonce`, `anvil_setCode`, `anvil_setStorageAt`,

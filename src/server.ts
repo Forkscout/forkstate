@@ -77,8 +77,18 @@ class NoEnvironment extends Error {
     }
 }
 
+/*
+ * `simulateBundle` is in here despite changing nothing.
+ *
+ * It runs inside a checkpoint it always reverts, so the overlay comes out as it
+ * went in — but it holds that checkpoint open across many transactions, and a
+ * real transaction landing in the middle would be committed into it and then
+ * thrown away with it. Queueing it costs a simulation waiting behind a write,
+ * which is the cheaper of the two. Persisting is a no-op for it either way,
+ * since nothing it does moves the environment's version.
+ */
 const MUTATES =
-    /^(eth_sendTransaction|eth_sendRawTransaction|anvil_|evm_|forkstate_(setChainId|setTokenBalance|sync|followHead))/;
+    /^(eth_sendTransaction|eth_sendRawTransaction|anvil_|evm_|forkstate_(setChainId|setTokenBalance|sync|followHead|simulateBundle))/;
 
 const mutating = (payload: unknown): boolean => {
     const one = (call: unknown) => MUTATES.test(String((call as { method?: unknown })?.method ?? ""));

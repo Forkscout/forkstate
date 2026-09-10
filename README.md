@@ -109,6 +109,11 @@ checkpoint the call is already thrown away with, so nothing reaches the fork.
 Geth's `state`, which blanks every slot not listed, is refused: the slots a fork
 would have to blank are the ones it has never read.
 
+**Bundles:** `forkstate_simulateBundle` runs several transactions in order, each
+seeing what the one before it did, and keeps none of it. An approve followed by
+a swap is two `eth_call`s that fail separately and one bundle that works. A
+transaction that reverts is undone on its own; the rest still run.
+
 **Tracing:** `debug_traceCall` returns the call tree of a call that is never
 committed; `debug_traceTransaction` returns the tree kept from when a
 transaction ran here. Opcode-level entries are opt-in — one swap is tens of

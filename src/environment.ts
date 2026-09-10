@@ -93,6 +93,49 @@ export interface CallResult {
     revertData?: string | null;
 }
 
+/**
+ * One transaction's worth of a bundle, after it ran.
+ *
+ * Shaped like a receipt rather than like `eth_call`'s answer, because that is
+ * the question being asked: not "what does this return" but "what would this
+ * do, and then what would the next one do on top of it".
+ */
+export interface BundleResult {
+    index: number;
+    from: string;
+    to: string | null;
+    /** 1 or 0, as a receipt reports it. */
+    status: 0 | 1;
+    gasUsed: string;
+    returnValue: string;
+    /** The decoded revert reason, when there was one. */
+    error: string | null;
+    revertData: string | null;
+    contractAddress: string | null;
+    logs: Array<{ address: string; topics: string[]; data: string; logIndex: string }>;
+    trace?: Trace;
+    diff?: StateDiff;
+}
+
+export interface BundleOptions {
+    /** Pretended state, applied once before the first transaction. */
+    overrides?: StateOverrides;
+    /** Call tree and opcodes per transaction. Off by default; it is not cheap. */
+    trace?: boolean;
+    /** Before-and-after for everything each transaction wrote. */
+    diff?: boolean;
+}
+
+/**
+ * How many transactions one bundle may contain.
+ *
+ * Each one runs the EVM and may reach the parent chain for state it has not
+ * seen, so a bundle is the one request a caller can make arbitrarily expensive
+ * by making it longer. This is generous for the thing bundles are for — a
+ * setup, the transaction under test, and the assertions around it.
+ */
+const MAX_BUNDLE = 64;
+
 /** Nobody's key. Used when a call arrives without a sender, which is normal for eth_call. */
 const ANONYMOUS = "0x0000000000000000000000000000000000000000";
 /**
@@ -563,6 +606,181 @@ export class Environment {
                 );
             }
         }
+    }
+
+    /**
+     * Runs several transactions in sequence and throws all of it away.
+     *
+     * The difference from calling `eth_call` three times is the only thing that
+     * matters here: each transaction sees what the ones before it did. An
+     * approve followed by a swap is two calls that fail separately and one
+     * bundle that works, and "why did this revert on chain when it simulated
+     * fine" is nearly always a sequence that was never simulated as one.
+     *
+     * Nothing survives. The whole bundle runs inside a checkpoint that is always
+     * reverted, exactly as `call()` does, so asking cannot change the fork.
+     *
+     * Each transaction also gets a checkpoint of its own, so a revert undoes
+     * that transaction and not the ones before it — and the bundle keeps going,
+     * because a caller who sent five transactions wants to know about all five
+     * and not only up to the first failure.
+     */
+    async simulateBundle(
+        transactions: CallRequest[], options: BundleOptions = {},
+    ): Promise<{ results: BundleResult[]; gasUsed: string; failed: boolean }> {
+        if (!Array.isArray(transactions) || transactions.length === 0) {
+            throw new Error("a bundle needs at least one transaction");
+        }
+        if (transactions.length > MAX_BUNDLE) {
+            throw new Error(
+                `a bundle may hold ${MAX_BUNDLE} transactions; this one has ${transactions.length}`,
+            );
+        }
+
+        await this.state.checkpoint();
+        // The overlay must not learn about any of this: it is all about to be
+        // reverted, and a recorded write would outlive the state behind it.
+        this.recording = false;
+        try {
+            if (options.overrides) await this.applyOverrides(options.overrides);
+
+            const results: BundleResult[] = [];
+            let total = 0n;
+            for (const [ index, request ] of transactions.entries()) {
+                const result = await this.simulateOne(index, request, options);
+                total += BigInt(result.gasUsed);
+                results.push(result);
+            }
+            return {
+                results,
+                gasUsed: "0x" + total.toString(16),
+                failed: results.some((result) => result.status === 0),
+            };
+        } finally {
+            this.recording = true;
+            this.capturing = null;
+            await this.state.revert();
+        }
+    }
+
+    /** One transaction of a bundle, on top of whatever the ones before it left. */
+    private async simulateOne(
+        index: number, request: CallRequest, options: BundleOptions,
+    ): Promise<BundleResult> {
+        const from = normaliseAddress(request.from ?? ANONYMOUS);
+        const sender = createAddressFromString(from);
+        const to = request.to ? normaliseAddress(request.to) : null;
+        const account = (await this.state.getAccount(sender)) ?? new Account();
+        const value = request.value ? BigInt(request.value) : 0n;
+
+        const empty: BundleResult = {
+            index, from, to,
+            status: 0,
+            gasUsed: "0x0",
+            returnValue: "0x",
+            error: null,
+            revertData: null,
+            contractAddress: null,
+            logs: [],
+        };
+
+        /*
+         * Refused before it runs, the way a chain refuses to include it.
+         *
+         * Reported rather than thrown: this transaction cannot go in, but the
+         * ones after it still can, and a caller asking about five transactions
+         * should hear about five.
+         */
+        if (value > account.balance) {
+            return {
+                ...empty,
+                error: `insufficient funds for transfer: address ${from} has `
+                    + `${account.balance}, wants ${value}`,
+            };
+        }
+
+        await this.state.checkpoint();
+        const stopTracing = options.trace
+            ? attachTracer(this.vm.evm as never, { storage: true })
+            : null;
+        if (options.diff) this.capturing = { accounts: {}, storage: {} };
+
+        let trace: Trace | null = null;
+        let result;
+        try {
+            try {
+                result = await this.vm.evm.runCall({
+                    caller: sender,
+                    to: to ? createAddressFromString(to) : undefined,
+                    data: callData(request),
+                    value,
+                    gasLimit: request.gas ? BigInt(request.gas) : DEFAULT_GAS,
+                });
+            } finally {
+                // Off before anything else can throw, or it stays attached to
+                // this environment for every call that follows.
+                trace = stopTracing ? stopTracing() : null;
+            }
+        } catch (error) {
+            this.capturing = null;
+            await this.state.revert();
+            // The EVM refused to start — a malformed target, a gas limit it
+            // cannot honour. Same treatment as a revert: reported, not fatal.
+            return { ...empty, error: error instanceof Error ? error.message : String(error) };
+        }
+
+        const exec = result.execResult;
+        const reverted = Boolean(exec.exceptionError);
+        const diff = this.capturing;
+        this.capturing = null;
+        if (trace && diff) await this.resolveReads(trace, diff);
+
+        if (reverted) {
+            await this.state.revert();
+        } else {
+            // The EVM run does not advance the sender's nonce; a chain does, and
+            // the next transaction in this bundle is entitled to see it.
+            const settled = (await this.state.getAccount(sender)) ?? account;
+            settled.nonce = account.nonce + 1n;
+            await this.state.putAccount(sender, settled);
+            await this.state.commit();
+        }
+
+        /*
+         * A reverted transaction still spends its nonce on a real chain, and the
+         * next transaction from the same sender has to account for that. Written
+         * after the revert, so it survives it — and still inside the bundle's own
+         * checkpoint, so it goes away with everything else.
+         */
+        if (reverted) {
+            const after = (await this.state.getAccount(sender)) ?? account;
+            after.nonce = account.nonce + 1n;
+            await this.state.putAccount(sender, after);
+        }
+
+        return {
+            index, from, to,
+            status: reverted ? 0 : 1,
+            gasUsed: "0x" + exec.executionGasUsed.toString(16),
+            returnValue: bytesToHex(exec.returnValue),
+            error: reverted ? this.revertReason(exec) : null,
+            revertData: reverted ? bytesToHex(exec.returnValue) : null,
+            contractAddress: result.createdAddress ? result.createdAddress.toString() : null,
+            // No block is mined, so these carry no block hash. What a caller
+            // wants from a simulated log is which contract said what, and that
+            // is all here.
+            logs: (exec.logs ?? []).map((entry, i) => ({
+                address: bytesToHex(entry[0]),
+                topics: entry[1].map((topic) => bytesToHex(topic)),
+                data: bytesToHex(entry[2]),
+                logIndex: "0x" + i.toString(16),
+            })),
+            ...(trace ? { trace } : {}),
+            // Only for a transaction that succeeded. A reverted one's writes were
+            // undone, and reporting them as state changes would describe a world
+            // that does not exist — the trace is where you look at what it tried.
+            ...(diff && !reverted ? { diff } : {}),
+        };
     }
 
     // ---- transactions -------------------------------------------------------
