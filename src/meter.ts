@@ -14,6 +14,8 @@
  * of them than it measured.
  */
 
+import { reportError } from "./report.ts";
+
 export interface Usage {
     envId: string;
     /** UTC, `YYYY-MM-DD`. A day is the smallest unit anyone bills on. */
@@ -113,7 +115,7 @@ export class Meter {
                 try {
                     this.onFlushed?.(batch);
                 } catch (error) {
-                    console.error("a usage listener threw:", error);
+                    reportError("a usage listener threw:", error);
                 }
             } catch (error) {
                 // Put it back rather than lose it: usage that vanishes because the
@@ -124,7 +126,7 @@ export class Meter {
                     held.misses += entry.misses;
                     held.forwarded += entry.forwarded;
                 }
-                console.error("could not write usage:", error);
+                reportError("could not write usage:", error);
             } finally {
                 this.flushing = null;
             }

@@ -16,6 +16,7 @@
  *     the receiver's problem; making it the sender's turns one broken webhook
  *     into a slow chain.
  */
+import { reportError } from "./report.ts";
 import { createHmac, randomUUID } from "node:crypto";
 
 import type { AlertRow, Backend, DeliveryRow } from "./backend.ts";
@@ -255,7 +256,7 @@ export class Alerts {
             try {
                 rows = await this.rowsFor(envId);
             } catch (error) {
-                console.error(`could not read alerts for ${envId}:`, error);
+                reportError(`could not read alerts for ${envId}:`, error);
                 return;
             }
 
@@ -384,7 +385,7 @@ export class Alerts {
             });
             this.cached.delete(row.envId);
         } catch (cause) {
-            console.error(`could not record a delivery for alert ${row.id}:`, cause);
+            reportError(`could not record a delivery for alert ${row.id}:`, cause);
         }
         return delivery;
     }

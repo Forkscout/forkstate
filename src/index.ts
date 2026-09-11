@@ -12,6 +12,7 @@ import { Store } from "./store.ts";
 import { openBackend } from "./backend.ts";
 import { Alerts } from "./alerts.ts";
 import { usageHook } from "./usage-hook.ts";
+import { reportError } from "./report.ts";
 import { UpstreamCache } from "./upstream-cache.ts";
 import { serve } from "./server.ts";
 
@@ -58,6 +59,18 @@ const cache = CACHE_DB === null ? new UpstreamCache(null) : new UpstreamCache(ba
  * trips, and a meter that wrote a row per read would spend more of them than it
  * measured.
  */
+/*
+ * A crash is still a crash — the platform restarts the process, and every
+ * environment reloads from the store — but somebody hears about it first.
+ */
+for (const event of [ "uncaughtException", "unhandledRejection" ] as const) {
+    process.on(event, (error: unknown) => {
+        reportError(`engine ${event}`, error);
+        // A moment for the report to leave, then the default: exit and restart.
+        setTimeout(() => process.exit(1), 1_500).unref();
+    });
+}
+
 const meter = new Meter(store);
 
 /*

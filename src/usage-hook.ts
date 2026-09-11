@@ -10,6 +10,7 @@
  * It says which environments, not how much: the numbers are already in the
  * database, and a hook that carried them would be a second copy to disagree.
  */
+import { reportError } from "./report.ts";
 import { createHmac } from "node:crypto";
 
 import type { Usage } from "./meter.ts";
@@ -37,9 +38,9 @@ export function usageHook(url: string, key: string): (entries: Usage[]) => void 
             body,
             signal: AbortSignal.timeout(TIMEOUT_MS),
         }).then((response) => {
-            if (!response.ok) console.error(`usage hook answered ${response.status}`);
+            if (!response.ok) reportError(`usage hook answered ${response.status}`);
         }).catch((error: unknown) => {
-            console.error("could not reach the usage hook:", error instanceof Error ? error.message : error);
+            reportError("could not reach the usage hook:", error instanceof Error ? error.message : error);
         });
     };
 }

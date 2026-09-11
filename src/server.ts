@@ -18,6 +18,7 @@ import { mutating, WriteQueue } from "./write-queue.ts";
 import type { Alerts } from "./alerts.ts";
 import type { StoredBlock, StoredTx } from "./chain.ts";
 import { serveSockets } from "./ws-server.ts";
+import { reportError } from "./report.ts";
 
 const MAX_BODY = 8 * 1024 * 1024;
 
@@ -300,9 +301,26 @@ export function serve(
 
                 send(res, 404, { error: "Not found" });
             } catch (error) {
-                send(res, 400, {
+                /*
+                 * The caller's fault or ours, said as which.
+                 *
+                 * Everything used to come back as a 400 parse error, so a
+                 * database that stopped answering looked to a client — and to
+                 * monitoring — like a malformed request. Only JSON that will not
+                 * parse, or a body too large, is the caller's.
+                 */
+                const theirs = error instanceof SyntaxError
+                    || (error instanceof Error && error.message === "request body too large");
+                if (theirs) {
+                    return send(res, 400, {
+                        jsonrpc: "2.0", id: null,
+                        error: { code: -32700, message: error instanceof Error ? error.message : "bad request" },
+                    });
+                }
+                reportError(`request to ${path} failed`, error);
+                send(res, 500, {
                     jsonrpc: "2.0", id: null,
-                    error: { code: -32700, message: error instanceof Error ? error.message : "bad request" },
+                    error: { code: -32603, message: "The engine hit an error answering this. It has been reported." },
                 });
             }
         })();

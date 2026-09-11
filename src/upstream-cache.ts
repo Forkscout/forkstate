@@ -9,6 +9,7 @@
  * are asking different questions, and answering one with the other's data would
  * be wrong in a way nothing downstream could detect.
  */
+import { reportError } from "./report.ts";
 import type { Backend } from "./backend.ts";
 
 export interface CacheStats {
@@ -104,7 +105,7 @@ export class UpstreamCache {
             } catch (error) {
                 // A cache that cannot write is slower, not broken — every value
                 // is still in memory and the next read falls through upstream.
-                console.error("cache flush:", error instanceof Error ? error.message : error);
+                reportError("cache flush:", error instanceof Error ? error.message : error);
             }
         });
         await this.flushing;

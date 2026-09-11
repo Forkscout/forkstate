@@ -6,6 +6,7 @@
  * one process, which is the whole reason this design is worth building — a chain
  * per sandbox does not.
  */
+import { reportError } from "./report.ts";
 import { randomUUID } from "node:crypto";
 import { Environment } from "./environment.ts";
 import { Store, type EnvironmentSummary } from "./store.ts";
@@ -117,7 +118,7 @@ export class Manager {
             } catch (error) {
                 // A parent that is briefly unreachable is not a reason to stop
                 // syncing the others, or to take the process down.
-                console.error(`sync ${id}:`, error instanceof Error ? error.message : error);
+                reportError(`sync ${id}:`, error instanceof Error ? error.message : error);
             }
         }
     }
@@ -203,7 +204,7 @@ export class Manager {
         } catch (error) {
             // If the store cannot say, keep serving. Refusing every request
             // because a lookup failed turns a database blip into an outage.
-            console.error(`could not read the suspension for ${id}:`, error);
+            reportError(`could not read the suspension for ${id}:`, error);
             return held?.value ?? null;
         }
         this.suspensions.set(id, { value, at: Date.now() });
@@ -220,7 +221,7 @@ export class Manager {
         await this.store.suspend(id, reason);
         this.suspensions.set(id, { value: { reason, at: Date.now() }, at: Date.now() });
         for (const listener of this.suspendedListeners) {
-            try { listener(id, reason); } catch (error) { console.error("a suspension listener threw:", error); }
+            try { listener(id, reason); } catch (error) { reportError("a suspension listener threw:", error); }
         }
     }
 
@@ -252,7 +253,7 @@ export class Manager {
             try {
                 await work();
             } catch (error) {
-                console.error(`deleting ${id}: could not remove its ${what}:`, error);
+                reportError(`deleting ${id}: could not remove its ${what}:`, error);
             }
         };
         await tidy("traces", () => this.store.deleteTraces(id));

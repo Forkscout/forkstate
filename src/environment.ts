@@ -7,6 +7,7 @@
  * writes and nothing else — an untouched one is a few hundred bytes, and it stays
  * current with the parent chain until a write shadows a value.
  */
+import { reportError } from "./report.ts";
 import { ForkStateManager } from "./state-manager.ts";
 import type { UpstreamCache } from "./upstream-cache.ts";
 import { createVM } from "@ethereumjs/vm";
@@ -1014,7 +1015,7 @@ export class Environment {
             if (trace) {
                 void this.archive.save(hash.toLowerCase(), trace, this.diffs.get(hash.toLowerCase()) ?? null)
                     .catch((error: unknown) => {
-                        console.error(`could not archive the trace for ${hash}:`, error);
+                        reportError(`could not archive the trace for ${hash}:`, error);
                     });
             }
         }
@@ -1305,7 +1306,7 @@ export class Environment {
             try {
                 watcher(block, txs);
             } catch (error) {
-                console.error("a block watcher threw:", error);
+                reportError("a block watcher threw:", error);
             }
         }
     }
