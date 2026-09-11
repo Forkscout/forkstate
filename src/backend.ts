@@ -120,6 +120,17 @@ export interface Backend {
     recordDelivery(row: DeliveryRow): Promise<void>;
     listDeliveries(alertId: string, limit: number): Promise<DeliveryRow[]>;
 
+    /**
+     * Environments told to stop answering, and why.
+     *
+     * Separate from the environment row, which is rewritten on every block under
+     * a revision check: a suspension landing between two writes would either be
+     * lost or make the next honest write fail as stale.
+     */
+    suspend(envId: string, reason: string): Promise<void>;
+    unsuspend(envId: string): Promise<boolean>;
+    suspension(envId: string): Promise<{ reason: string; at: number } | null>;
+
     cacheGet(key: string): Promise<string | null>;
     /** Written in one round trip: a cold call misses dozens of keys at once. */
     cachePut(entries: Array<[string, string]>): Promise<void>;
@@ -190,6 +201,11 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     matches  INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS alert_deliveries_alert ON alert_deliveries (alert_id, at DESC);
+CREATE TABLE IF NOT EXISTS suspensions (
+    env_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    at     INTEGER NOT NULL
+);
 `;
 
 const toAlert = (row: Record<string, unknown>): AlertRow => ({
@@ -384,6 +400,23 @@ class SqliteBackend implements Backend {
             .all(alertId, limit) as Array<Record<string, unknown>>).map(toDelivery);
     }
 
+    async suspend(envId: string, reason: string) {
+        this.db.prepare(`
+            INSERT INTO suspensions (env_id, reason, at) VALUES (?, ?, ?)
+            ON CONFLICT(env_id) DO UPDATE SET reason = excluded.reason, at = excluded.at`)
+            .run(envId, reason, Date.now());
+    }
+
+    async unsuspend(envId: string) {
+        return Number(this.db.prepare("DELETE FROM suspensions WHERE env_id = ?").run(envId).changes) > 0;
+    }
+
+    async suspension(envId: string) {
+        const row = this.db.prepare("SELECT reason, at FROM suspensions WHERE env_id = ?").get(envId) as
+            { reason: string; at: number } | undefined;
+        return row ? { reason: String(row.reason), at: Number(row.at) } : null;
+    }
+
     async cacheGet(key: string) {
         const row = this.db.prepare("SELECT value FROM upstream WHERE key = ?").get(key) as
             { value: string } | undefined;
@@ -412,7 +445,7 @@ class SqliteBackend implements Backend {
 const SCHEMA_LOCK = 8_314_206;
 
 /** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 /**
  * Which row of `schema_meta` is the engine's.
@@ -496,6 +529,11 @@ CREATE TABLE IF NOT EXISTS alert_deliveries (
     matches  int NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS alert_deliveries_alert ON alert_deliveries (alert_id, at DESC);
+CREATE TABLE IF NOT EXISTS suspensions (
+    env_id text PRIMARY KEY,
+    reason text NOT NULL,
+    at     bigint NOT NULL
+);
 `;
 
 const fromPostgres = (row: Record<string, unknown>): SavedRow => ({
@@ -701,6 +739,22 @@ class PostgresBackend implements Backend {
             SELECT * FROM alert_deliveries WHERE alert_id = ${alertId}
             ORDER BY at DESC LIMIT ${limit}`;
         return rows.map(toDelivery);
+    }
+
+    async suspend(envId: string, reason: string) {
+        await this.sql`
+            INSERT INTO suspensions (env_id, reason, at) VALUES (${envId}, ${reason}, ${Date.now()})
+            ON CONFLICT (env_id) DO UPDATE SET reason = EXCLUDED.reason, at = EXCLUDED.at`;
+    }
+
+    async unsuspend(envId: string) {
+        const gone = await this.sql`DELETE FROM suspensions WHERE env_id = ${envId}`;
+        return gone.count > 0;
+    }
+
+    async suspension(envId: string) {
+        const [ row ] = await this.sql`SELECT reason, at FROM suspensions WHERE env_id = ${envId} LIMIT 1`;
+        return row ? { reason: String(row.reason), at: Number(row.at) } : null;
     }
 
     async cacheGet(key: string) {

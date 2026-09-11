@@ -119,6 +119,18 @@ export class Store {
         return this.backend.loadTrace(envId, hash);
     }
 
+    async suspend(envId: string, reason: string) {
+        return this.backend.suspend(envId, reason);
+    }
+
+    async unsuspend(envId: string) {
+        return this.backend.unsuspend(envId);
+    }
+
+    async suspension(envId: string) {
+        return this.backend.suspension(envId);
+    }
+
     async listAlerts(envId: string) {
         return this.backend.listAlerts(envId);
     }

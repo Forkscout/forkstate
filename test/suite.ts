@@ -26,6 +26,7 @@ import { Meter } from "../src/meter.ts";
 import { UpstreamCache } from "../src/upstream-cache.ts";
 import { serve } from "../src/server.ts";
 import { Alerts } from "../src/alerts.ts";
+import { usageHook } from "../src/usage-hook.ts";
 import { signSocketUrl } from "../src/ws-server.ts";
 
 const RPC = process.env.FORKSTATE_RPC;
@@ -1676,6 +1677,131 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
                 assert.match(
                     (await call("forkstate_createAlert", [ { name: "x", url: hook.url, kind: "vibes" } ]))
                         .error!.message, /logs, transactions or blocks/);
+            } finally {
+                hook.close();
+            }
+        });
+    });
+
+    describe("suspending an environment", () => {
+        const suspend = (id: string, reason = "out of credit") => fetch(`${BASE}/environments/${id}/suspension`, {
+            method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason }),
+        });
+        const restore = (id: string) => fetch(`${BASE}/environments/${id}/suspension`, { method: "DELETE" });
+
+        it("refuses calls with the reason it was given, and serves them again once lifted", async () => {
+            const env = await newEnv({ name: "suspend-http" });
+            const call = rpcFor(env.id);
+            assert.ok((await call("eth_blockNumber")).result);
+
+            assert.equal((await suspend(env.id, "no credit left")).status, 200);
+            const raw = await fetch(`${BASE}/${env.id}`, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_blockNumber", params: [] }),
+            });
+            assert.equal(raw.status, 402);
+            const refused = await raw.json() as { error: { code: number; message: string } };
+            assert.equal(refused.error.code, -32005);
+            assert.equal(refused.error.message, "no credit left");
+
+            await restore(env.id);
+            assert.ok((await call("eth_blockNumber")).result, "lifting it brings the environment back");
+        });
+
+        it("keeps the state it had while suspended", async () => {
+            const env = await newEnv({ name: "suspend-state" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ DEAD, "0x1234" ]);
+            await suspend(env.id);
+            await restore(env.id);
+            assert.equal(await ok("eth_getBalance", [ DEAD, "latest" ]), "0x1234");
+        });
+
+        it("does not count a refused call as usage", async () => {
+            const meter = new Meter(null);
+            const env = await newEnv({ name: "suspend-meter" });
+            await suspend(env.id);
+            const before = meter.unflushed(env.id).requests;
+            await rpcFor(env.id)("eth_blockNumber");
+            assert.equal(meter.unflushed(env.id).requests, before);
+            await restore(env.id);
+        });
+
+        it("refuses a socket for a suspended environment", async () => {
+            const env = await newEnv({ name: "suspend-ws-open" });
+            await suspend(env.id);
+            await assert.rejects(() => openSocket(env.id), /402/);
+            await restore(env.id);
+            const socket = await openSocket(env.id);
+            socket.close();
+        });
+
+        it("shuts a socket that was already open", async () => {
+            // The door this closes: a socket opened while the account could pay
+            // used to stay open, and subscribed, however far past zero it went.
+            const env = await newEnv({ name: "suspend-ws-live" });
+            const { WebSocket } = await import("ws");
+            const socket = new WebSocket(`ws://127.0.0.1:${PORT}/${env.id}`);
+            await new Promise((resolve, reject) => { socket.once("open", resolve); socket.once("error", reject); });
+            const closed = new Promise<{ code: number; reason: string }>((resolve) =>
+                socket.once("close", (code: number, reason: Buffer) => resolve({ code, reason: reason.toString() })));
+
+            await suspend(env.id, "out of credit");
+            const { code, reason } = await closed;
+            assert.equal(code, 4402);
+            assert.equal(reason, "out of credit");
+            await restore(env.id);
+        });
+
+        it("is seen by another process sharing the store", async () => {
+            const env = await newEnv({ name: "suspend-shared" });
+            await suspend(env.id);
+            const other = new Manager(store, { cache: new UpstreamCache(await openBackend({
+                url: process.env.TEST_DATABASE_URL, path: join(dir, "t.db"),
+            })), checkpoint: 100 });
+            assert.ok(await other.suspension(env.id), "a second replica must refuse it too");
+            await restore(env.id);
+        });
+
+        it("goes away with the environment", async () => {
+            const env = await newEnv({ name: "suspend-delete" });
+            await suspend(env.id);
+            await fetch(`${BASE}/environments/${env.id}`, { method: "DELETE" });
+            assert.equal(await store.suspension(env.id), null);
+        });
+    });
+
+    describe("telling the console that usage happened", () => {
+        it("posts the environments that spent something, signed with the engine key", async () => {
+            const hook = await receiver();
+            try {
+                const meter = new Meter(store, 0);
+                meter.onFlushed = usageHook(hook.url, "hook-secret");
+                meter.miss("env-costs");
+                meter.request("env-free", 50);   // requests alone cost nothing
+                meter.forward("env-history");
+                await meter.flush();
+                await hook.waitFor(1);
+
+                const [ delivery ] = hook.received;
+                assert.deepEqual(new Set(delivery!.body.environments), new Set([ "env-costs", "env-history" ]),
+                    "an environment that only made free requests is not worth a message");
+                const expected = createHmac("sha256", "hook-secret").update(delivery!.raw).digest("hex");
+                assert.equal(delivery!.signature, `sha256=${expected}`);
+            } finally {
+                hook.close();
+            }
+        });
+
+        it("says nothing when nothing cost anything", async () => {
+            const hook = await receiver();
+            try {
+                const meter = new Meter(store, 0);
+                meter.onFlushed = usageHook(hook.url, "hook-secret");
+                meter.request("env-quiet", 10);
+                await meter.flush();
+                await new Promise((r) => setTimeout(r, 300));
+                assert.equal(hook.received.length, 0);
             } finally {
                 hook.close();
             }

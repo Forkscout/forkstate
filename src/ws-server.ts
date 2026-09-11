@@ -168,6 +168,13 @@ export function serveSockets(options: {
                 socket.destroy();
                 return;
             }
+            // Refused at the handshake, the way the HTTP side refuses a request:
+            // this was the one door a suspended account could still walk through.
+            if (await manager.suspension(id)) {
+                socket.write("HTTP/1.1 402 Payment Required\r\nconnection: close\r\n\r\n");
+                socket.destroy();
+                return;
+            }
             sockets.handleUpgrade(request, socket, head, (client) => {
                 attach(client, id, env);
             });
@@ -242,6 +249,9 @@ export function serveSockets(options: {
             // Cheap, and bounds how long a re-created environment can go
             // unnoticed by a subscription that is otherwise idle.
             if (subscriptions.size > 0) void rewatch();
+            void manager.suspension(id).then((stopped) => {
+                if (stopped) client.close(4402, stopped.reason.slice(0, 120));
+            });
         }, HEARTBEAT_MS);
         heartbeat.unref?.();
 
@@ -263,6 +273,16 @@ export function serveSockets(options: {
                 const refuse = (code: number, message: string, data?: unknown) => send({
                     jsonrpc: "2.0", id: request.id ?? null, error: { code, message, ...(data ? { data } : {}) },
                 });
+
+                // Checked per message as well as at the handshake: a socket opened
+                // while the account could pay stays open after it cannot. Cached,
+                // so this is a map lookup nearly every time.
+                const stopped = await manager.suspension(id);
+                if (stopped) {
+                    refuse(-32005, stopped.reason);
+                    client.close(4402, stopped.reason.slice(0, 120));
+                    return;
+                }
 
                 // Counted and limited exactly as an HTTP call is; a socket is a
                 // cheaper way to ask, not a free one.
@@ -348,9 +368,21 @@ export function serveSockets(options: {
             })();
         });
 
+        /*
+         * Shut the moment this process suspends the environment, rather than at
+         * the next message — a subscriber may never send another one, and would
+         * otherwise go on receiving events for as long as it stayed connected.
+         * Another replica's suspension is caught by the per-message check and
+         * the heartbeat, within the suspension cache's ten seconds.
+         */
+        const stopSuspended = manager.onSuspended((suspended, reason) => {
+            if (suspended === id) client.close(4402, reason.slice(0, 120));
+        });
+
         const shut = () => {
             clearInterval(heartbeat);
             stopWatching();
+            stopSuspended();
             subscriptions.clear();
         };
         client.on("close", shut);

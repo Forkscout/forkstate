@@ -159,10 +159,49 @@ export function serve(
                     return send(res, 200, { deleted: await manager.delete(single[1]) });
                 }
 
+                /*
+                 * Stopping an environment without deleting it.
+                 *
+                 * The engine does not know about money; whoever runs it does,
+                 * and uses this to stop an account that has run out. Its state
+                 * is kept exactly as it was, and lifting the suspension brings
+                 * it back as if nothing happened.
+                 */
+                const suspending = /^\/environments\/([0-9a-f-]+|default)\/suspension$/.exec(path);
+                if (suspending?.[1]) {
+                    const target = suspending[1];
+                    if (req.method === "GET") {
+                        return send(res, 200, { suspension: await manager.suspension(target) });
+                    }
+                    if (req.method === "PUT") {
+                        const options = JSON.parse((await body(req)) || "{}") as { reason?: unknown };
+                        const reason = String(options.reason ?? "").trim() || "This testnet is suspended.";
+                        await manager.setSuspension(target, reason.slice(0, 200));
+                        return send(res, 200, { suspended: true });
+                    }
+                    if (req.method === "DELETE") {
+                        await manager.setSuspension(target, null);
+                        return send(res, 200, { suspended: false });
+                    }
+                }
+
                 // ---- JSON-RPC, one environment per path
                 if (req.method === "POST") {
                     const id = path === "/" ? "default" : path.slice(1);
                     const payload = JSON.parse(await body(req)) as unknown;
+
+                    // Before metering or limiting: a suspended environment does
+                    // no work, so there is nothing to count.
+                    const stopped = await manager.suspension(id);
+                    if (stopped) {
+                        return send(res, 402, {
+                            jsonrpc: "2.0",
+                            id: null,
+                            // The code a node uses when it will not do the work,
+                            // and the one the console's own refusal already uses.
+                            error: { code: -32005, message: stopped.reason },
+                        });
+                    }
 
                     // Charged per call, so a batch costs what it actually is.
                     const cost = Array.isArray(payload) ? Math.max(payload.length, 1) : 1;

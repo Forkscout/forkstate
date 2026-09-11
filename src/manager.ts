@@ -18,6 +18,11 @@ import type { Meter } from "./meter.ts";
  * should try again, and a retry will succeed, which is a different thing to say
  * than "something went wrong".
  */
+/** Why an environment was told to stop, and when. */
+export interface Suspension { reason: string; at: number }
+
+const SUSPENSION_TTL = 10_000;
+
 export class StaleEnvironment extends Error {
     readonly id: string;
 
@@ -178,6 +183,53 @@ export class Manager {
         return await this.store.list();
     }
 
+    /**
+     * Whether an environment has been told to stop, remembered briefly.
+     *
+     * Asked on every request and every socket message, so it cannot be a query
+     * each time. Ten seconds is also the longest another replica can go on
+     * serving after a suspension lands on this one — this replica hears about
+     * its own at once.
+     */
+    private readonly suspensions = new Map<string, { value: Suspension | null; at: number }>();
+    private readonly suspendedListeners = new Set<(id: string, reason: string) => void>();
+
+    async suspension(id: string): Promise<Suspension | null> {
+        const held = this.suspensions.get(id);
+        if (held && Date.now() - held.at < SUSPENSION_TTL) return held.value;
+        let value: Suspension | null;
+        try {
+            value = await this.store.suspension(id);
+        } catch (error) {
+            // If the store cannot say, keep serving. Refusing every request
+            // because a lookup failed turns a database blip into an outage.
+            console.error(`could not read the suspension for ${id}:`, error);
+            return held?.value ?? null;
+        }
+        this.suspensions.set(id, { value, at: Date.now() });
+        return value;
+    }
+
+    /** Stops an environment answering, or lets it answer again with `null`. */
+    async setSuspension(id: string, reason: string | null): Promise<void> {
+        if (reason === null) {
+            await this.store.unsuspend(id);
+            this.suspensions.set(id, { value: null, at: Date.now() });
+            return;
+        }
+        await this.store.suspend(id, reason);
+        this.suspensions.set(id, { value: { reason, at: Date.now() }, at: Date.now() });
+        for (const listener of this.suspendedListeners) {
+            try { listener(id, reason); } catch (error) { console.error("a suspension listener threw:", error); }
+        }
+    }
+
+    /** Told the moment this process suspends something, so open sockets can be shut. */
+    onSuspended(listener: (id: string, reason: string) => void): () => void {
+        this.suspendedListeners.add(listener);
+        return () => { this.suspendedListeners.delete(listener); };
+    }
+
     async delete(id: string): Promise<boolean> {
         this.live.delete(id);
         // The traces go with it. Left behind they would be unreachable rows that
@@ -186,6 +238,8 @@ export class Manager {
         // So do the alerts, and for a second reason: an alert outliving its
         // environment is a URL this engine would keep posting to for nothing.
         await this.store.deleteAlerts(id);
+        await this.store.unsuspend(id);
+        this.suspensions.delete(id);
         return this.store.delete(id);
     }
 

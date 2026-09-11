@@ -42,6 +42,13 @@ export class Meter {
     private readonly sink: UsageSink | null;
     private readonly pending = new Map<string, Usage>();
     private timer: ReturnType<typeof setInterval> | null = null;
+    /**
+     * Told what was just written, after it was written.
+     *
+     * For whatever needs to act on spend as it happens — the console stopping an
+     * account that has run out — without polling the database to find out.
+     */
+    onFlushed: ((entries: Usage[]) => void) | null = null;
     /** Set while a flush is in flight, so two never overlap. */
     private flushing: Promise<void> | null = null;
 
@@ -103,6 +110,11 @@ export class Meter {
         this.flushing = (async () => {
             try {
                 await this.sink!.addUsage(batch);
+                try {
+                    this.onFlushed?.(batch);
+                } catch (error) {
+                    console.error("a usage listener threw:", error);
+                }
             } catch (error) {
                 // Put it back rather than lose it: usage that vanishes because the
                 // database blinked is usage somebody is not billed for.

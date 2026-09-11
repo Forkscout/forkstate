@@ -11,6 +11,7 @@ import { Meter } from "./meter.ts";
 import { Store } from "./store.ts";
 import { openBackend } from "./backend.ts";
 import { Alerts } from "./alerts.ts";
+import { usageHook } from "./usage-hook.ts";
 import { UpstreamCache } from "./upstream-cache.ts";
 import { serve } from "./server.ts";
 
@@ -58,6 +59,21 @@ const cache = CACHE_DB === null ? new UpstreamCache(null) : new UpstreamCache(ba
  * measured.
  */
 const meter = new Meter(store);
+
+/*
+ * Whoever bills for this engine, told when spend happens.
+ *
+ * Signed with the engine key, so the receiver can tell it from anyone who found
+ * the URL. Off unless configured: a local engine has nobody to tell.
+ */
+const USAGE_HOOK = process.env.FORKSTATE_USAGE_HOOK;
+if (USAGE_HOOK) {
+    if (!process.env.FORKSTATE_KEY) {
+        console.warn("  FORKSTATE_USAGE_HOOK is set without FORKSTATE_KEY; it will not be sent unsigned");
+    } else {
+        meter.onFlushed = usageHook(USAGE_HOOK, process.env.FORKSTATE_KEY);
+    }
+}
 
 const manager = new Manager(store, {
     cache, checkpoint: CHECKPOINT, chainId: CHAIN_ID, syncInterval: SYNC_INTERVAL, meter,
