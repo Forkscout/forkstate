@@ -232,14 +232,33 @@ export class Manager {
 
     async delete(id: string): Promise<boolean> {
         this.live.delete(id);
-        // The traces go with it. Left behind they would be unreachable rows that
-        // nothing ever deletes, growing for the life of the database.
-        await this.store.deleteTraces(id);
-        // So do the alerts, and for a second reason: an alert outliving its
-        // environment is a URL this engine would keep posting to for nothing.
-        await this.store.deleteAlerts(id);
-        await this.store.unsuspend(id);
         this.suspensions.delete(id);
+
+        /*
+         * What belongs to it goes with it, but none of that may stop the delete.
+         *
+         * These used to run one after another before the environment itself, so
+         * the first to fail left the environment in place with its traces already
+         * gone — which happened in production when the alerts table did not yet
+         * exist, and left an environment nobody could remove. Each is tried; a
+         * failure is logged and leaves a few unreachable rows, which is a far
+         * smaller harm than an environment that refuses to die.
+         *
+         * Traces left behind would grow for the life of the database; an alert
+         * outliving its environment is a URL this engine would keep posting to;
+         * a suspension would sit on an id that may one day be reused.
+         */
+        const tidy = async (what: string, work: () => Promise<unknown>) => {
+            try {
+                await work();
+            } catch (error) {
+                console.error(`deleting ${id}: could not remove its ${what}:`, error);
+            }
+        };
+        await tidy("traces", () => this.store.deleteTraces(id));
+        await tidy("alerts", () => this.store.deleteAlerts(id));
+        await tidy("suspension", () => this.store.unsuspend(id));
+
         return this.store.delete(id);
     }
 

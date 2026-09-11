@@ -90,6 +90,17 @@ starts, prints its banner, and is stopped a moment later.
 
 Set both to the same number, or set neither and let `PORT` decide.
 
+### How the hosted engine deploys
+
+The Railway service is connected to this repository's `main` branch and set to
+wait for CI: a push deploys only after every check on that commit has passed,
+so a change that fails the Postgres suite never reaches production. It also
+only deploys when something the image is built from changed — `src/**`,
+`package.json`, `bun.lock`, `Dockerfile` — so a push that touches only docs or
+tests is skipped rather than restarting the engine for nothing.
+
+`railway up` still works for deploying something that is not on `main`.
+
 ### Adding a dependency
 
 The image installs with `bun install --frozen-lockfile`, so a dependency added

@@ -1763,6 +1763,21 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             await restore(env.id);
         });
 
+        it("deletes the environment even when tidying up after it fails", async () => {
+            // Observed in production: the alerts table was missing, the cleanup
+            // threw, and the environment stayed — its traces already gone.
+            const env = await newEnv({ name: "delete-despite" });
+            const original = store.deleteAlerts.bind(store);
+            store.deleteAlerts = async () => { throw new Error("relation \"alerts\" does not exist"); };
+            try {
+                const answer = await (await fetch(`${BASE}/environments/${env.id}`, { method: "DELETE" })).json() as { deleted: boolean };
+                assert.equal(answer.deleted, true);
+                assert.equal(await store.load(env.id), null, "and it is really gone");
+            } finally {
+                store.deleteAlerts = original;
+            }
+        });
+
         it("goes away with the environment", async () => {
             const env = await newEnv({ name: "suspend-delete" });
             await suspend(env.id);
