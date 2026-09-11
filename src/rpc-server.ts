@@ -209,6 +209,49 @@ function receiptToRpc(tx: StoredTx): unknown {
 }
 
 /** "latest", "0x1f", 31 — all mean a height here. */
+/**
+ * Which state a block tag asks about: ours now, the parent's, or none at all.
+ *
+ * State reads used to ignore the tag, so asking for a balance at block N got
+ * the balance now — a confident wrong answer, the worst kind for an indexer or
+ * an explorer reading history. A block at or before the fork is exactly the
+ * parent's state at that block, so it is asked there. A block mined here but
+ * not the latest has no state kept for it, and saying so beats making one up.
+ */
+type StateAt = { where: "here" } | { where: "parent" } | { where: "nowhere"; message: string };
+
+function stateAt(env: Environment, tag: unknown): StateAt {
+    if (tag === undefined || tag === null) return { where: "here" };
+    if (typeof tag === "string" && MOVING_TAG.has(tag)) return { where: "here" };
+    if (tag === "earliest") return { where: "parent" };
+
+    const fork = Number(env.forkBlock);
+    const latest = env.blockNumber();
+    let number: number;
+    if (typeof tag === "object") {
+        // EIP-1898: { blockNumber } or { blockHash }.
+        const byHash = (tag as { blockHash?: string }).blockHash;
+        if (byHash) {
+            const ours = env.getBlock(byHash);
+            if (!ours) return { where: "parent" };
+            number = ours.number;
+        } else {
+            number = Number(BigInt(String((tag as { blockNumber?: unknown }).blockNumber ?? latest)));
+        }
+    } else {
+        number = Number(BigInt(String(tag)));
+    }
+
+    if (number === latest) return { where: "here" };
+    if (number > latest) return { where: "nowhere", message: `header not found: block ${number} is not mined yet` };
+    if (number <= fork) return { where: "parent" };
+    return {
+        where: "nowhere",
+        message: `state is not kept for past blocks mined on this fork (${fork + 1}–${latest - 1}); `
+            + `ask for "latest", or for a block at or before the fork (${fork})`,
+    };
+}
+
 function toHeight(env: Environment, tag: unknown): number {
     if (tag === undefined || tag === null || tag === "latest" || tag === "pending" || tag === "safe" || tag === "finalized") {
         return env.blockNumber();
@@ -284,13 +327,24 @@ export async function handleRpc(
                     + "include this environment's writes", -32601);
 
             // ---- state, through the overlay
-            case "eth_getBalance": return reply(hex(await env.getBalance(String(params[0]))));
-            case "eth_getTransactionCount": return reply(hex(await env.getNonce(String(params[0]))));
-            case "eth_getCode": return reply(await env.getCode(String(params[0])));
-            case "eth_getStorageAt": return reply(await env.getStorageAt(String(params[0]), String(params[1])));
+            case "eth_getBalance":
+            case "eth_getTransactionCount":
+            case "eth_getCode":
+            case "eth_getStorageAt": {
+                const at = stateAt(env, params[method === "eth_getStorageAt" ? 2 : 1]);
+                if (at.where === "parent") return reply(await env.passthrough(method, params));
+                if (at.where === "nowhere") return fail(at.message);
+                if (method === "eth_getBalance") return reply(hex(await env.getBalance(String(params[0]))));
+                if (method === "eth_getTransactionCount") return reply(hex(await env.getNonce(String(params[0]))));
+                if (method === "eth_getCode") return reply(await env.getCode(String(params[0])));
+                return reply(await env.getStorageAt(String(params[0]), String(params[1])));
+            }
 
             // ---- execution
             case "eth_call": {
+                const at = stateAt(env, params[1]);
+                if (at.where === "parent") return reply(await env.passthrough(method, params));
+                if (at.where === "nowhere") return fail(at.message);
                 const call = params[0] as Record<string, string>;
                 // The third parameter, as Geth defines it: state to pretend is
                 // true for this call only.
@@ -407,12 +461,40 @@ export async function handleRpc(
 
             case "eth_getLogs": {
                 const filter = (params[0] ?? {}) as Record<string, unknown>;
-                return reply(env.getLogs({
-                    fromBlock: filter.fromBlock === undefined ? undefined : toHeight(env, filter.fromBlock),
-                    toBlock: filter.toBlock === undefined ? undefined : toHeight(env, filter.toBlock),
-                    address: filter.address as string | string[] | undefined,
-                    topics: filter.topics as (string | null)[] | undefined,
-                }));
+                const address = filter.address as string | string[] | undefined;
+                const topics = filter.topics as (string | null)[] | undefined;
+
+                // One block, named by hash. It used to be ignored, and every log
+                // the fork had ever emitted came back as if it were in that block.
+                if (filter.blockHash !== undefined) {
+                    const block = env.getBlock(String(filter.blockHash));
+                    if (!block) break;   // not ours: a block from before the fork, the parent's
+                    return reply(env.getLogs({ fromBlock: block.number, toBlock: block.number, address, topics }));
+                }
+
+                const from = filter.fromBlock === undefined ? undefined : toHeight(env, filter.fromBlock);
+                const to = filter.toBlock === undefined ? undefined : toHeight(env, filter.toBlock);
+                const local = env.getLogs({ fromBlock: from, toBlock: to, address, topics });
+
+                /*
+                 * History from before the fork is the parent's.
+                 *
+                 * A range reaching back past the fork used to return only what
+                 * was mined here, so an indexer backfilling from a block before
+                 * the fork got silence where the chain had events. Only when a
+                 * start was asked for: an open range would ask the parent for
+                 * its whole history.
+                 */
+                const fork = Number(env.forkBlock);
+                if (from !== undefined && from <= fork) {
+                    const upstream = await env.passthrough<unknown[]>("eth_getLogs", [ {
+                        ...filter,
+                        fromBlock: hex(from),
+                        toBlock: hex(to === undefined ? fork : Math.min(to, fork)),
+                    } ]);
+                    return reply([ ...(upstream ?? []), ...local ]);
+                }
+                return reply(local);
             }
 
             // ---- filters. A filter made on the parent watches the parent, so a
@@ -479,9 +561,9 @@ export async function handleRpc(
                 return reply(null);
             case "anvil_mine":
             case "evm_mine":
-                return reply(hex(env.mine(params[0] ? Number(BigInt(String(params[0]))) : 1)));
+                return reply(hex(await env.mine(params[0] ? Number(BigInt(String(params[0]))) : 1)));
             case "evm_increaseTime":
-                return reply(env.increaseTime(Number(params[0])));
+                return reply(await env.increaseTime(Number(params[0])));
             case "evm_snapshot":
                 return reply(env.snapshot());
             case "evm_revert":

@@ -266,6 +266,9 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const env = await newEnv({ name: "legacy" });
             const ok = okFor(env.id);
             await ok("anvil_setBalance", [SIGNER, "0x56bc75e2d63100000"]);
+            // Signed with nonce 0, and on the parent chain this well-known key has
+            // been used thousands of times. The engine used to take any nonce.
+            await ok("anvil_setNonce", [SIGNER, "0x0"]);
 
             const common = new Common({ chain: { ...Mainnet, chainId: env.chainId } });
             const tx = createLegacyTx(
@@ -284,6 +287,9 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const env = await newEnv({ name: "recover" });
             const ok = okFor(env.id);
             await ok("anvil_setBalance", [SIGNER, "0x56bc75e2d63100000"]);
+            // Signed with nonce 0, and on the parent chain this well-known key has
+            // been used thousands of times. The engine used to take any nonce.
+            await ok("anvil_setNonce", [SIGNER, "0x0"]);
 
             const before = BigInt(await ok("eth_getBalance", [DEAD, "latest"]));
             const common = new Common({ chain: { ...Mainnet, chainId: env.chainId } });
@@ -302,6 +308,9 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const env = await newEnv({ name: "typed" });
             const ok = okFor(env.id);
             await ok("anvil_setBalance", [SIGNER, "0x56bc75e2d63100000"]);
+            // Signed with nonce 0, and on the parent chain this well-known key has
+            // been used thousands of times. The engine used to take any nonce.
+            await ok("anvil_setNonce", [SIGNER, "0x0"]);
 
             const before = BigInt(await ok("eth_getBalance", [DEAD, "latest"]));
             const common = new Common({ chain: { ...Mainnet, chainId: env.chainId } });
@@ -454,6 +463,9 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const env = await newEnv({ name: "rechain", chainId: 4242 });
             const ok = okFor(env.id);
             await ok("anvil_setBalance", [SIGNER, "0x56bc75e2d63100000"]);
+            // Signed with nonce 0, and on the parent chain this well-known key has
+            // been used thousands of times. The engine used to take any nonce.
+            await ok("anvil_setNonce", [SIGNER, "0x0"]);
 
             assert.equal(await ok("forkstate_setChainId", [9911]), "0x26b7");
             assert.equal(await ok("eth_chainId", []), "0x26b7");
@@ -1903,6 +1915,165 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const times = await Promise.all([ height - 2, height - 1, height ].map(async (n) =>
                 BigInt((await ok("eth_getBlockByNumber", [ "0x" + n.toString(16), false ])).timestamp)));
             assert.ok(times[0]! <= times[1]! && times[1]! <= times[2]!, `timestamps ${times.join(", ")}`);
+        });
+    });
+
+    describe("matching what a real chain does", () => {
+        const chainCommon = async (id: string) =>
+            new Common({ chain: { ...Mainnet, chainId: Number(BigInt(await okFor(id)("eth_chainId"))) } });
+        const signedTransfer = async (id: string, nonce: bigint, to: string, value = 1000n) =>
+            bytesToHex(createLegacyTx({ nonce, gasPrice: 1_000_000_000n, gasLimit: 21_000n, to: to as `0x${string}`, value },
+                { common: await chainCommon(id) }).sign(KEY).serialize());
+
+        it("refuses the same signed transaction twice", async () => {
+            // It used to run twice: the second copy moved the same value again.
+            const env = await newEnv({ name: "real-replay" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+            const TO = "0x000000000000000000000000000000000000fe04";
+            const nonce = BigInt(await ok("eth_getTransactionCount", [ SIGNER, "latest" ]));
+            const raw = await signedTransfer(env.id, nonce, TO);
+
+            await ok("eth_sendRawTransaction", [ raw ]);
+            const again = await rpcFor(env.id)("eth_sendRawTransaction", [ raw ]);
+            assert.match(again.error!.message, /nonce too low/);
+            assert.equal(BigInt(await ok("eth_getBalance", [ TO, "latest" ])), 1000n, "moved once");
+        });
+
+        it("refuses an old nonce, and never sets an account's nonce back", async () => {
+            const env = await newEnv({ name: "real-nonce-low" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+            await ok("anvil_setNonce", [ SIGNER, "0x5" ]);
+            const stale = await signedTransfer(env.id, 2n, DEAD);
+            const answer = await rpcFor(env.id)("eth_sendRawTransaction", [ stale ]);
+            assert.match(answer.error!.message, /nonce too low/);
+            assert.equal(await ok("eth_getTransactionCount", [ SIGNER, "latest" ]), "0x5");
+        });
+
+        it("refuses a nonce from the future rather than skipping ahead", async () => {
+            const env = await newEnv({ name: "real-nonce-high" });
+            await okFor(env.id)("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+            const nonce = BigInt(await okFor(env.id)("eth_getTransactionCount", [ SIGNER, "latest" ]));
+            const answer = await rpcFor(env.id)("eth_sendRawTransaction", [ await signedTransfer(env.id, nonce + 3n, DEAD) ]);
+            assert.match(answer.error!.message, /nonce too high/);
+        });
+
+        it("charges a plain transfer 21000 gas, and calldata on top", async () => {
+            // Receipts used to report only gas burned inside the call: 0 here.
+            const env = await newEnv({ name: "real-gas" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ SIGNER, "0x56bc75e2d63100000" ]);
+            const plain = await ok("eth_getTransactionReceipt", [
+                await ok("eth_sendTransaction", [ { from: SIGNER, to: DEAD, value: "0x1" } ]) ]);
+            assert.equal(BigInt(plain.gasUsed), 21_000n);
+
+            const withData = await ok("eth_getTransactionReceipt", [
+                await ok("eth_sendTransaction", [ { from: SIGNER, to: DEAD, data: "0x" + "ff".repeat(100) } ]) ]);
+            assert.ok(BigInt(withData.gasUsed) > 21_000n + 100n * 16n - 1n, `calldata costs gas: ${BigInt(withData.gasUsed)}`);
+        });
+
+        it("refuses a gas limit that does not cover the transaction's own cost", async () => {
+            const env = await newEnv({ name: "real-intrinsic" });
+            const answer = await rpcFor(env.id)("eth_sendTransaction", [
+                { from: SIGNER, to: DEAD, gas: "0x5000", data: "0x" + "ff".repeat(64) } ]);
+            assert.match(answer.error!.message, /intrinsic gas too low/);
+        });
+
+        it("estimates enough gas for a transaction heavy with calldata", async () => {
+            const env = await newEnv({ name: "real-estimate" });
+            const ok = okFor(env.id);
+            const request = { from: SIGNER, to: DEAD, data: "0x" + "ab".repeat(4000) };
+            const estimate = await ok("eth_estimateGas", [ request ]);
+            const receipt = await ok("eth_getTransactionReceipt", [
+                await ok("eth_sendTransaction", [ { ...request, gas: estimate } ]) ]);
+            assert.equal(receipt.status, "0x1", "a transaction sent with the estimate must not run out");
+        });
+
+        it("gives BLOCKHASH the real hash of the block before", async () => {
+            // It used to be zero for every block.
+            const env = await newEnv({ name: "real-blockhash" });
+            const ok = okFor(env.id);
+            const AT = "0x000000000000000000000000000000000000fe02";
+            // BLOCKHASH(NUMBER - 1) -> slot 0
+            await ok("anvil_setCode", [ AT, "0x43600190034060005500" ]);
+            await ok("anvil_mine", [ "0x2" ]);
+            const receipt = await ok("eth_getTransactionReceipt", [
+                await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]) ]);
+            const before = await ok("eth_getBlockByNumber", [ "0x" + (BigInt(receipt.blockNumber) - 1n).toString(16), false ]);
+            assert.equal(BigInt(await ok("eth_getStorageAt", [ AT, "0x0", "latest" ])), BigInt(before.hash));
+        });
+
+        it("gives BLOCKHASH the parent's hash for a block before the fork", async () => {
+            const env = await newEnv({ name: "real-blockhash-parent" });
+            const ok = okFor(env.id);
+            const AT = "0x000000000000000000000000000000000000fe09";
+            // BLOCKHASH(NUMBER - 2) -> slot 0; on a fresh fork that is the block before the fork block.
+            await ok("anvil_setCode", [ AT, "0x43600290034060005500" ]);
+            await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]);
+            const target = "0x" + (BigInt(env.forkBlock) - 1n).toString(16);
+            const parent = await rpcFor(env.id)("eth_getBlockByNumber", [ target, false ]);
+            assert.equal(BigInt(await ok("eth_getStorageAt", [ AT, "0x0", "latest" ])), BigInt(parent.result.hash));
+        });
+
+        it("names the fork block as the parent of the first block mined", async () => {
+            // A zero parent looked, to an indexer, like a reorg the moment the fork mined.
+            const env = await newEnv({ name: "real-parent" });
+            const ok = okFor(env.id);
+            await ok("anvil_mine", [ "0x1" ]);
+            const first = await ok("eth_getBlockByNumber", [ "latest", false ]);
+            const fork = await ok("eth_getBlockByNumber", [ env.forkBlock, false ]);
+            assert.equal(BigInt(first.number), BigInt(env.forkBlock) + 1n);
+            assert.equal(first.parentHash, fork.hash);
+        });
+
+        it("answers state at a block before the fork from the parent", async () => {
+            const env = await newEnv({ name: "real-history-parent" });
+            const ok = okFor(env.id);
+            const old = "0x" + (BigInt(env.forkBlock) - 5000n).toString(16);
+            const here = await ok("eth_getBalance", [ DEAD, old ]);
+            const direct = await (await fetch(RPC!, {
+                method: "POST", headers: { "content-type": "application/json" },
+                body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "eth_getBalance", params: [ DEAD, old ] }),
+            })).json() as { result: string };
+            assert.equal(BigInt(here), BigInt(direct.result));
+        });
+
+        it("says so, rather than answering with today's state, for a past block mined here", async () => {
+            const env = await newEnv({ name: "real-history-local" });
+            const ok = okFor(env.id);
+            const X = "0x000000000000000000000000000000000000fe03";
+            await ok("anvil_setBalance", [ X, "0x1" ]);
+            await ok("anvil_mine", [ "0x1" ]);
+            const then = await ok("eth_blockNumber");
+            await ok("anvil_setBalance", [ X, "0x2" ]);
+            await ok("anvil_mine", [ "0x1" ]);
+            const answer = await rpcFor(env.id)("eth_getBalance", [ X, then ]);
+            assert.match(answer.error!.message, /not kept/);
+            assert.equal(await ok("eth_getBalance", [ X, "latest" ]), "0x2");
+            assert.equal(await ok("eth_getBalance", [ X, await ok("eth_blockNumber") ]), "0x2",
+                "the latest block by number is still answered");
+        });
+
+        it("returns only the logs of the block named by hash", async () => {
+            const env = await newEnv({ name: "real-logs-hash" });
+            const ok = okFor(env.id);
+            const AT = "0x000000000000000000000000000000000000fe06";
+            await ok("anvil_setCode", [ AT, "0x60006000a000" ]);   // LOG0, empty
+            const first = await ok("eth_getTransactionReceipt", [
+                await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]) ]);
+            await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]);
+            const logs = await ok("eth_getLogs", [ { address: AT, blockHash: first.blockHash } ]);
+            assert.equal(logs.length, 1);
+        });
+
+        it("includes the parent's logs for a range that starts before the fork", async () => {
+            const env = await newEnv({ name: "real-logs-history" });
+            const ok = okFor(env.id);
+            const TRANSFER = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+            const from = "0x" + (BigInt(env.forkBlock) - 2n).toString(16);
+            const logs = await ok("eth_getLogs", [ { address: USDT, topics: [ TRANSFER ], fromBlock: from, toBlock: env.forkBlock } ]);
+            assert.ok(logs.length > 0, "USDT moves every block on the parent; the fork used to say nothing happened");
         });
     });
 

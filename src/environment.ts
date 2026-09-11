@@ -11,11 +11,35 @@ import { ForkStateManager } from "./state-manager.ts";
 import type { UpstreamCache } from "./upstream-cache.ts";
 import { createVM } from "@ethereumjs/vm";
 import { Common, Mainnet } from "@ethereumjs/common";
-import { createTxFromRLP } from "@ethereumjs/tx";
+import { createLegacyTx, createTxFromRLP } from "@ethereumjs/tx";
 import { RLP } from "@ethereumjs/rlp";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { Account, Address, bytesToHex, createAddressFromString, hexToBytes, utf8ToBytes } from "@ethereumjs/util";
 import type { VM } from "@ethereumjs/vm";
+
+/**
+ * Where the EVM gets a block's hash for BLOCKHASH.
+ *
+ * Left to itself it uses a stand-in blockchain that answers zero for every
+ * block, so `blockhash(block.number - 1)` was always 0 — which quietly breaks
+ * anything that seeds randomness or checks a commitment with it. This answers
+ * from the environment: its own blocks by their recorded hash, and blocks from
+ * before the fork by asking the parent chain.
+ */
+class BlockHashes {
+    source: { blockHashAt(number: number): Promise<Uint8Array> } | null = null;
+
+    async getBlock(number: number | bigint) {
+        const hash = this.source ? await this.source.blockHashAt(Number(number)) : new Uint8Array(32);
+        return { hash: () => hash };
+    }
+
+    async putBlock(): Promise<void> {}
+
+    shallowCopy(): BlockHashes {
+        return this;
+    }
+}
 
 /** The block the EVM reads `block.*` from, as its own call options define it. */
 type EvmBlock = NonNullable<Parameters<VM["evm"]["runCall"]>[0]["block"]>;
@@ -367,6 +391,12 @@ export class Environment {
      */
     private readonly watchers = new Set<(block: StoredBlock, txs: StoredTx[]) => void>();
     private nextFilterId = 1;
+    /** Handed to the EVM for BLOCKHASH; set once the environment exists. */
+    private hashes: BlockHashes | null = null;
+    /** Hashes of blocks before the fork, which never change once fetched. */
+    private readonly parentHashes = new Map<number, Uint8Array>();
+    /** The fork block's real hash: the parent of the first block mined here. */
+    private forkHash: string | null = null;
     private autoImpersonate = false;
     /** Off while a call runs: a call is reverted, so what it wrote is not ours to keep. */
     private recording = true;
@@ -412,7 +442,8 @@ export class Environment {
         // Mainnet rules with the chain id swapped: the fork runs the same EVM as the
         // network it reads from, which is the only way its results mean anything.
         const common = new Common({ chain: { ...Mainnet, chainId } });
-        const vm = await createVM({ common, stateManager: state });
+        const hashes = new BlockHashes();
+        const vm = await createVM({ common, stateManager: state, blockchain: hashes as never });
 
         const env = new Environment(
             chainId, forkBlock, rpcUrl, state, vm,
@@ -421,6 +452,8 @@ export class Environment {
             options.cache ?? null,
             common,
         );
+        hashes.source = env;
+        env.hashes = hashes;
         env.recordWrites();
         return env;
     }
@@ -717,6 +750,13 @@ export class Environment {
             };
         }
 
+        const gasLimit = request.gas ? BigInt(request.gas) : DEFAULT_GAS;
+        const bounds = this.gasBounds(this.asTransaction(request, gasLimit));
+        const minimum = bounds.intrinsic > bounds.floor ? bounds.intrinsic : bounds.floor;
+        if (gasLimit < minimum) {
+            return { ...empty, error: `intrinsic gas too low: have ${gasLimit}, want ${minimum}` };
+        }
+
         await this.state.checkpoint();
         const stopTracing = options.trace
             ? attachTracer(this.vm.evm as never, { storage: true })
@@ -732,7 +772,7 @@ export class Environment {
                     to: to ? createAddressFromString(to) : undefined,
                     data: callData(request),
                     value,
-                    gasLimit: request.gas ? BigInt(request.gas) : DEFAULT_GAS,
+                    gasLimit: gasLimit - bounds.intrinsic,
                     block,
                 });
             } finally {
@@ -780,7 +820,7 @@ export class Environment {
         return {
             index, from, to,
             status: reverted ? 0 : 1,
-            gasUsed: "0x" + exec.executionGasUsed.toString(16),
+            gasUsed: "0x" + this.gasUsedBy(bounds, exec).toString(16),
             returnValue: bytesToHex(exec.returnValue),
             error: reverted ? this.revertReason(exec) : null,
             revertData: reverted ? bytesToHex(exec.returnValue) : null,
@@ -812,7 +852,12 @@ export class Environment {
      * key for — and it is what `anvil_impersonateAccount` exists to allow. A signed
      * transaction is accepted too; its signature simply is not what decides who sent it.
      */
-    async sendTransaction(request: TransactionRequest, signedHash?: string): Promise<StoredTx> {
+    async sendTransaction(
+        request: TransactionRequest,
+        signedHash?: string,
+        /** The decoded transaction, when it arrived signed: its own intrinsic gas rules apply. */
+        decoded?: { getIntrinsicGas(): bigint; data: Uint8Array },
+    ): Promise<StoredTx> {
         const from = normaliseAddress(request.from ?? ANONYMOUS);
         if (!this.autoImpersonate && !this.impersonated.has(from) && !this.isDevAccount(from)) {
             // Not a hard error: a devnet that refuses unknown senders is a devnet
@@ -822,8 +867,38 @@ export class Environment {
 
         const sender = createAddressFromString(from);
         const account = (await this.state.getAccount(sender)) ?? new Account();
-        const nonce = request.nonce !== undefined ? BigInt(request.nonce) : account.nonce;
+        /*
+         * The nonce must be the account's next one, exactly.
+         *
+         * Taken on trust, a signed transaction sent twice ran twice — the second
+         * copy moved the same value again — and one signed with an old nonce ran
+         * and then set the account's nonce back to it. The same words geth uses,
+         * because wallets and ethers recognise them and react correctly.
+         */
+        const nonce = account.nonce;
+        if (request.nonce !== undefined) {
+            const given = BigInt(request.nonce);
+            if (given < nonce) {
+                throw new Error(`nonce too low: address ${from}, tx: ${given} state: ${nonce}`);
+            }
+            if (given > nonce) {
+                throw new Error(
+                    `nonce too high: address ${from}, tx: ${given} state: ${nonce}. This fork mines each `
+                    + "transaction as it arrives and does not hold later ones back; send the gap first.",
+                );
+            }
+        }
         const gasLimit = request.gas ? BigInt(request.gas) : DEFAULT_GAS;
+
+        // Charged before the call runs, as the network charges it: a gas limit
+        // that does not cover the transaction's own cost is refused, and what
+        // the call gets to spend is what is left.
+        const bounds = this.gasBounds(decoded ?? this.asTransaction(request, gasLimit));
+        const minimum = bounds.intrinsic > bounds.floor ? bounds.intrinsic : bounds.floor;
+        if (gasLimit < minimum) {
+            throw new Error(`intrinsic gas too low: have ${gasLimit}, want ${minimum}`);
+        }
+        await this.ensureForkHash();
         const value = request.value ? BigInt(request.value) : 0n;
         const data = request.data ?? request.input ?? "0x";
 
@@ -851,7 +926,7 @@ export class Environment {
                 to: request.to ? createAddressFromString(normaliseAddress(request.to)) : undefined,
                 data: hexToBytes(data as `0x${string}`),
                 value,
-                gasLimit,
+                gasLimit: gasLimit - bounds.intrinsic,
                 block: this.blockContext(next),
             });
         } finally {
@@ -881,7 +956,7 @@ export class Environment {
         entry.balance = "0x" + settled.balance.toString(16);
 
         const created = result.createdAddress ? result.createdAddress.toString() : null;
-        const gasUsed = exec.executionGasUsed;
+        const gasUsed = this.gasUsedBy(bounds, exec);
         // A signed transaction already has a hash, and it is the one the sender is
         // polling for a receipt on — inventing our own would strand the wallet.
         const hash = signedHash ?? this.hashFor(from, nonce, data, value);
@@ -986,7 +1061,7 @@ export class Environment {
             gas: "0x" + tx.gasLimit.toString(16),
             nonce: "0x" + tx.nonce.toString(16),
             gasPrice: "gasPrice" in tx ? "0x" + (tx as { gasPrice: bigint }).gasPrice.toString(16) : "0x0",
-        }, bytesToHex(tx.hash()));
+        }, bytesToHex(tx.hash()), tx);
     }
 
     /** Whether this is one of the parent chain's accounts we already treat as unlocked. */
@@ -1061,6 +1136,86 @@ export class Environment {
         return bytesToHex(keccak_256(utf8ToBytes(material)));
     }
 
+    /** A block's hash for BLOCKHASH: ours as recorded, the parent's as it reports. */
+    async blockHashAt(number: number): Promise<Uint8Array> {
+        const local = this.chain.getBlock(number);
+        if (local) return hexToBytes(local.hash as `0x${string}`);
+        if (number > Number(this.forkBlock)) return new Uint8Array(32);
+
+        const held = this.parentHashes.get(number);
+        if (held) return held;
+        try {
+            const block = await this.passthrough<{ hash?: string } | null>(
+                "eth_getBlockByNumber", [ "0x" + number.toString(16), false ]);
+            if (block?.hash) {
+                const bytes = hexToBytes(block.hash as `0x${string}`);
+                this.parentHashes.set(number, bytes);
+                return bytes;
+            }
+        } catch {
+            // The parent not answering is no reason to fail the transaction:
+            // BLOCKHASH of an unknown block is zero on any chain.
+        }
+        return new Uint8Array(32);
+    }
+
+    /**
+     * Makes sure the first block mined here names the fork block as its parent.
+     *
+     * It used to name a hash of zeros, which broke the one thing an indexer
+     * checks before anything else — that each block's parent is the block
+     * before it — so a fork looked like a reorg the moment it mined.
+     */
+    private async ensureForkHash(): Promise<void> {
+        if (this.chain.latest() || this.forkHash) return;
+        const bytes = await this.blockHashAt(Number(this.forkBlock));
+        if (bytes.some((byte) => byte !== 0)) this.forkHash = bytesToHex(bytes);
+    }
+
+    /**
+     * Intrinsic gas, and the EIP-7623 calldata floor, for a transaction.
+     *
+     * Receipts used to report only what the EVM burned inside the call, so a
+     * plain transfer used 0 gas and a deployment was cheaper than calldata
+     * alone can be. The same rules the network applies, read from the same
+     * Common, so they move with the hardfork.
+     */
+    private gasBounds(tx: { getIntrinsicGas(): bigint; data: Uint8Array }): { intrinsic: bigint; floor: bigint } {
+        const intrinsic = tx.getIntrinsicGas();
+        // The transaction's own Common: a transaction registers the gas
+        // parameters it needs on the copy it holds, not on the one it was given.
+        const common = (tx as unknown as { common?: Common }).common ?? this.common;
+        let floor = 0n;
+        if (common.isActivatedEIP(7623)) {
+            let tokens = 0n;
+            for (const byte of tx.data) tokens += byte === 0 ? 1n : 4n;
+            floor = common.param("txGas") + common.param("totalCostFloorPerToken") * tokens;
+        }
+        return { intrinsic, floor };
+    }
+
+    /** What a request would be as a transaction, for the gas rules above. */
+    private asTransaction(request: CallRequest | TransactionRequest, gasLimit: bigint) {
+        const data = (request as CallRequest).data ?? (request as CallRequest).input ?? "0x";
+        return createLegacyTx({
+            to: request.to ? createAddressFromString(normaliseAddress(request.to)) : undefined,
+            data: hexToBytes(data as `0x${string}`),
+            value: request.value ? BigInt(request.value) : 0n,
+            gasLimit,
+            gasPrice: 0n,
+        }, { common: this.common });
+    }
+
+    /** Gas a finished execution used, as a receipt reports it: intrinsic, less refunds, above the floor. */
+    private gasUsedBy(bounds: { intrinsic: bigint; floor: bigint }, exec: { executionGasUsed: bigint; gasRefund?: bigint }): bigint {
+        const spent = bounds.intrinsic + exec.executionGasUsed;
+        // The VM's Common carries the refund rule; the environment's does not.
+        const cap = spent / this.vm.common.param("maxRefundQuotient");
+        const refund = (exec.gasRefund ?? 0n) < cap ? (exec.gasRefund ?? 0n) : cap;
+        const used = spent - refund;
+        return used > bounds.floor ? used : bounds.floor;
+    }
+
     /**
      * The block the next transaction will land in: its number, and its time.
      *
@@ -1119,7 +1274,7 @@ export class Environment {
         const block: StoredBlock = {
             number,
             hash,
-            parentHash: parent?.hash ?? "0x" + "0".repeat(64),
+            parentHash: parent?.hash ?? this.forkHash ?? "0x" + "0".repeat(64),
             timestamp,
             gasUsed: "0x" + gasUsed.toString(16),
             gasLimit: "0x" + DEFAULT_GAS.toString(16),
@@ -1156,7 +1311,8 @@ export class Environment {
     }
 
     /** Produces empty blocks, for a contract that counts them. */
-    mine(count = 1): number {
+    async mine(count = 1): Promise<number> {
+        await this.ensureForkHash();
         for (let i = 0; i < count; i++) {
             this.mineBlock([], 0n);
             this.announce(this.chain.latest()!, []);
@@ -1164,7 +1320,8 @@ export class Environment {
         return this.chain.height;
     }
 
-    increaseTime(seconds: number): number {
+    async increaseTime(seconds: number): Promise<number> {
+        await this.ensureForkHash();
         this.timeOffset += seconds;
         this.mineBlock([], 0n);
         this.announce(this.chain.latest()!, []);
@@ -1271,6 +1428,7 @@ export class Environment {
 
         this.forkBlock = head;
         this.overlay.forkBlock = "0x" + head.toString(16);
+        this.forkHash = null;
         this.revision++;
         // Every value the state manager cached was read at the old block, so it
         // has to go with the tag: mixing two heights is how a fork starts
@@ -1307,7 +1465,9 @@ export class Environment {
         this.state = new ForkStateManager({ provider: this.rpcUrl, blockTag: this.forkBlock, cache: this.cache });
         this.state.onUpstreamFetch = this.upstreamFetch;
         this.common = new Common({ chain: { ...Mainnet, chainId: this.chainId } });
-        this.vm = await createVM({ common: this.common, stateManager: this.state });
+        this.vm = await createVM({
+            common: this.common, stateManager: this.state, blockchain: (this.hashes ?? undefined) as never,
+        });
         this.recordWrites();
         await this.reapplyOverlay();
     }
@@ -1631,9 +1791,13 @@ export class Environment {
     async estimateGas(request: CallRequest): Promise<bigint> {
         const result = await this.call(request);
         if (result.reverted) throw new Error(result.error ?? "reverted");
-        // The EVM reports what it burned; a caller needs headroom for the difference
-        // between a simulated run and a real one.
-        return (BigInt(result.gasUsed) * 12n) / 10n + 21_000n;
+        // The EVM reports what it burned inside the call; the transaction also
+        // pays its intrinsic cost — calldata, creation — which a flat 21000
+        // undercounts for anything but a plain transfer. The headroom covers
+        // the gap between a simulated run and a real one.
+        const bounds = this.gasBounds(this.asTransaction(request, DEFAULT_GAS));
+        const estimate = bounds.intrinsic + (BigInt(result.gasUsed) * 12n) / 10n;
+        return estimate > bounds.floor ? estimate : bounds.floor;
     }
 
     /** Reads that this environment has no answer for, and the parent chain does. */
