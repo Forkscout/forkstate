@@ -168,6 +168,65 @@ export function serve(
                  * is kept exactly as it was, and lifting the suspension brings
                  * it back as if nothing happened.
                  */
+                /*
+                 * Copies of an environment: a whole new one, or named snapshots
+                 * of this one to come back to.
+                 */
+                const cloning = /^\/environments\/([0-9a-f-]+|default)\/clone$/.exec(path);
+                if (cloning?.[1] && req.method === "POST") {
+                    const options = JSON.parse((await body(req)) || "{}") as { name?: unknown };
+                    const source = cloning[1];
+                    // Through the source's queue, so the copy is never of a state
+                    // halfway through one of its transactions.
+                    const made = await queue.run(source, () => manager.clone(source,
+                        options.name === undefined ? undefined : String(options.name).slice(0, 80)));
+                    if (!made) return send(res, 404, { error: `No environment "${source}".` });
+                    const { id, env } = made;
+                    return send(res, 201, {
+                        id,
+                        rpcUrl: `http://127.0.0.1:${port}/${id}`,
+                        chainId: env.chainId,
+                        forkBlock: "0x" + env.forkBlock.toString(16),
+                        followsHead: env.followsHead,
+                    });
+                }
+
+                const snapshots = /^\/environments\/([0-9a-f-]+|default)\/snapshots$/.exec(path);
+                if (snapshots?.[1]) {
+                    if (req.method === "GET") {
+                        return send(res, 200, { snapshots: await manager.listSnapshots(snapshots[1]) });
+                    }
+                    if (req.method === "POST") {
+                        const options = JSON.parse((await body(req)) || "{}") as { name?: unknown };
+                        const target = snapshots[1];
+                        // Through the queue: a snapshot taken halfway through a
+                        // transaction would be a state that never existed.
+                        const taken = await queue.run(target, () => manager.snapshot(target, String(options.name ?? "")));
+                        if (!taken) return send(res, 404, { error: `No environment "${target}".` });
+                        return send(res, 201, { snapshot: taken });
+                    }
+                }
+
+                const snapshot = /^\/environments\/([0-9a-f-]+|default)\/snapshots\/([0-9a-f]+)(\/restore)?$/.exec(path);
+                if (snapshot?.[1] && snapshot[2]) {
+                    const [ , target, sid, restore ] = snapshot;
+                    if (restore && req.method === "POST") {
+                        try {
+                            const restored = await queue.run(target, () => manager.restoreSnapshot(target, sid));
+                            if (!restored) return send(res, 404, { error: `No snapshot "${sid}" for this environment.` });
+                            return send(res, 200, { restored });
+                        } catch (error) {
+                            if (error instanceof StaleEnvironment) {
+                                return send(res, 409, { error: "The environment changed while restoring; send it again." });
+                            }
+                            throw error;
+                        }
+                    }
+                    if (!restore && req.method === "DELETE") {
+                        return send(res, 200, { deleted: await manager.deleteSnapshot(target, sid) });
+                    }
+                }
+
                 const suspending = /^\/environments\/([0-9a-f-]+|default)\/suspension$/.exec(path);
                 if (suspending?.[1]) {
                     const target = suspending[1];

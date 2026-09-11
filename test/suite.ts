@@ -1695,6 +1695,141 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("clones and snapshots", () => {
+        const post = async (path: string, body: unknown = {}) => {
+            const res = await fetch(`${BASE}${path}`, {
+                method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+            });
+            return { status: res.status, body: await res.json() as any };
+        };
+
+        it("copies a testnet exactly, then lets the two go their own ways", async () => {
+            const env = await newEnv({ name: "clone-source" });
+            const ok = okFor(env.id);
+            await ok("evm_mine");
+            await ok("evm_mine");
+            // Set just before the copy, so it is only in memory: the clone must
+            // still see it.
+            await ok("anvil_setBalance", [ DEAD, "0x1234" ]);
+            const head = await ok("eth_blockNumber");
+
+            const made = await post(`/environments/${env.id}/clone`, { name: "clone-copy" });
+            assert.equal(made.status, 201);
+            assert.notEqual(made.body.id, env.id);
+            assert.equal(made.body.chainId, env.chainId);
+            assert.equal(made.body.forkBlock, env.forkBlock);
+
+            const copy = okFor(made.body.id);
+            assert.equal(await copy("eth_getBalance", [ DEAD, "latest" ]), "0x1234");
+            assert.equal(await copy("eth_blockNumber"), head, "mined blocks come along");
+            assert.equal((await copy("eth_getBlockByNumber", [ head, false ])).hash,
+                (await ok("eth_getBlockByNumber", [ head, false ])).hash, "the same blocks, not new ones");
+
+            await copy("anvil_setBalance", [ DEAD, "0x99" ]);
+            await copy("evm_mine");
+            assert.equal(await ok("eth_getBalance", [ DEAD, "latest" ]), "0x1234", "the original is untouched");
+            assert.equal(await ok("eth_blockNumber"), head);
+        });
+
+        it("brings receipts and traces with it", async () => {
+            const env = await newEnv({ name: "clone-traces" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ HOLDER, "0x56BC75E2D63100000" ]);
+            const hash = await ok("eth_sendTransaction", [ { from: HOLDER, to: DEAD, value: "0x1" } ]);
+
+            const made = await post(`/environments/${env.id}/clone`);
+            assert.equal(made.status, 201);
+            const copy = okFor(made.body.id);
+            assert.equal((await copy("eth_getTransactionReceipt", [ hash ])).status, "0x1");
+            assert.ok(await copy("debug_traceTransaction", [ hash, { tracer: "callTracer" } ]),
+                "a trace is kept outside the chain, and must be copied on its own");
+        });
+
+        it("names the copy after the original unless told otherwise", async () => {
+            const env = await newEnv({ name: "clone-named" });
+            const made = await post(`/environments/${env.id}/clone`);
+            assert.equal((await store.load(made.body.id))?.name, "clone-named (copy)");
+        });
+
+        it("does not copy a suspension", async () => {
+            const env = await newEnv({ name: "clone-suspended" });
+            await fetch(`${BASE}/environments/${env.id}/suspension`, {
+                method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason: "x" }),
+            });
+            const made = await post(`/environments/${env.id}/clone`);
+            assert.ok((await rpcFor(made.body.id)("eth_blockNumber")).result);
+            await fetch(`${BASE}/environments/${env.id}/suspension`, { method: "DELETE" });
+        });
+
+        it("says so when there is nothing to copy", async () => {
+            assert.equal((await post("/environments/nothere1/clone")).status, 404);
+        });
+
+        it("saves a snapshot and goes back to it", async () => {
+            const env = await newEnv({ name: "snapshot-restore" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            const head = await ok("eth_blockNumber");
+
+            const taken = await post(`/environments/${env.id}/snapshots`, { name: "before the change" });
+            assert.equal(taken.status, 201);
+            assert.equal(taken.body.snapshot.name, "before the change");
+            assert.equal(taken.body.snapshot.blocks, 1);
+
+            await ok("anvil_setBalance", [ DEAD, "0x2" ]);
+            await ok("evm_mine");
+            await ok("evm_mine");
+
+            const restored = await post(`/environments/${env.id}/snapshots/${taken.body.snapshot.id}/restore`);
+            assert.equal(restored.status, 200);
+            assert.equal(await ok("eth_getBalance", [ DEAD, "latest" ]), "0x1");
+            assert.equal(await ok("eth_blockNumber"), head);
+
+            // And it is what is stored, not only what is in memory.
+            assert.equal((await store.load(env.id))?.chain.blocks.length, 1);
+
+            // A snapshot can be gone back to more than once.
+            await ok("anvil_setBalance", [ DEAD, "0x3" ]);
+            await post(`/environments/${env.id}/snapshots/${taken.body.snapshot.id}/restore`);
+            assert.equal(await ok("eth_getBalance", [ DEAD, "latest" ]), "0x1");
+        });
+
+        it("lists snapshots newest first, and deletes one", async () => {
+            const env = await newEnv({ name: "snapshot-list" });
+            const first = (await post(`/environments/${env.id}/snapshots`, { name: "one" })).body.snapshot;
+            await new Promise((resolve) => setTimeout(resolve, 5));
+            const second = (await post(`/environments/${env.id}/snapshots`, { name: "two" })).body.snapshot;
+
+            const listed = await (await fetch(`${BASE}/environments/${env.id}/snapshots`)).json() as {
+                snapshots: Array<{ id: string; name: string; overlay?: unknown }>;
+            };
+            assert.deepEqual(listed.snapshots.map((s) => s.name), [ "two", "one" ]);
+            assert.equal(listed.snapshots[0]!.overlay, undefined, "a listing does not carry the state");
+
+            const gone = await (await fetch(`${BASE}/environments/${env.id}/snapshots/${first.id}`, { method: "DELETE" })).json() as { deleted: boolean };
+            assert.equal(gone.deleted, true);
+            const after = await (await fetch(`${BASE}/environments/${env.id}/snapshots`)).json() as { snapshots: Array<{ id: string }> };
+            assert.deepEqual(after.snapshots.map((s) => s.id), [ second.id ]);
+        });
+
+        it("keeps one testnet's snapshots away from another", async () => {
+            const a = await newEnv({ name: "snapshot-a" });
+            const b = await newEnv({ name: "snapshot-b" });
+            const taken = (await post(`/environments/${a.id}/snapshots`, { name: "a's" })).body.snapshot;
+            assert.equal((await post(`/environments/${b.id}/snapshots/${taken.id}/restore`)).status, 404);
+            const gone = await (await fetch(`${BASE}/environments/${b.id}/snapshots/${taken.id}`, { method: "DELETE" })).json() as { deleted: boolean };
+            assert.equal(gone.deleted, false);
+        });
+
+        it("goes away with the testnet", async () => {
+            const env = await newEnv({ name: "snapshot-delete" });
+            await post(`/environments/${env.id}/snapshots`, { name: "doomed" });
+            await fetch(`${BASE}/environments/${env.id}`, { method: "DELETE" });
+            assert.deepEqual(await store.listSnapshots(env.id), []);
+        });
+    });
+
     describe("suspending an environment", () => {
         const suspend = (id: string, reason = "out of credit") => fetch(`${BASE}/environments/${id}/suspension`, {
             method: "PUT", headers: { "content-type": "application/json" }, body: JSON.stringify({ reason }),

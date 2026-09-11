@@ -5,7 +5,7 @@
  * balance — so it is stored whole rather than as a table of writes. What that
  * buys is that restoring an environment is one read and no assembly.
  */
-import type { Backend, SavedRow, UsageRow } from "./backend.ts";
+import type { Backend, SavedRow, SnapshotRow, UsageRow } from "./backend.ts";
 import type { Overlay } from "./overlay.ts";
 import type { Chain } from "./chain.ts";
 
@@ -117,6 +117,30 @@ export class Store {
 
     async loadTrace(envId: string, hash: string): Promise<{ trace: string; diff: string } | null> {
         return this.backend.loadTrace(envId, hash);
+    }
+
+    async copyTraces(fromEnv: string, toEnv: string) {
+        return this.backend.copyTraces(fromEnv, toEnv);
+    }
+
+    async saveSnapshot(row: SnapshotRow) {
+        return this.backend.saveSnapshot(row);
+    }
+
+    async listSnapshots(envId: string) {
+        return this.backend.listSnapshots(envId);
+    }
+
+    async loadSnapshot(envId: string, id: string) {
+        return this.backend.loadSnapshot(envId, id);
+    }
+
+    async deleteSnapshot(envId: string, id: string) {
+        return this.backend.deleteSnapshot(envId, id);
+    }
+
+    async deleteSnapshots(envId: string) {
+        return this.backend.deleteSnapshots(envId);
     }
 
     async suspend(envId: string, reason: string) {

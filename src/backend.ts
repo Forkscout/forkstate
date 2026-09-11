@@ -41,6 +41,26 @@ export interface SavedRow {
     revision: number;
 }
 
+/** A named copy of an environment's state. */
+export interface SnapshotRow {
+    id: string;
+    envId: string;
+    name: string;
+    createdAt: number;
+    /** How many blocks the environment had mined when it was taken. */
+    blocks: number;
+    /**
+     * The parent block it was forked from at the time. A testnet that follows
+     * the parent's head moves this, and the saved state only makes sense
+     * against the block it was read from.
+     */
+    forkBlock: string;
+    overlay: string;
+    chain: string;
+}
+
+export type SnapshotSummary = Omit<SnapshotRow, "overlay" | "chain" | "forkBlock">;
+
 /** One environment's totals for one day. */
 export interface UsageRow {
     envId: string;
@@ -127,6 +147,22 @@ export interface Backend {
      * a revision check: a suspension landing between two writes would either be
      * lost or make the next honest write fail as stale.
      */
+    /** A new environment's traces start as the old one's, for a clone. */
+    copyTraces(fromEnv: string, toEnv: string): Promise<void>;
+
+    /**
+     * Named copies of an environment's state, kept until deleted.
+     *
+     * Rows of their own rather than a column: an environment may have many,
+     * each the size of the environment, and none of them should ride along
+     * every time the environment itself is written.
+     */
+    saveSnapshot(row: SnapshotRow): Promise<void>;
+    listSnapshots(envId: string): Promise<SnapshotSummary[]>;
+    loadSnapshot(envId: string, id: string): Promise<SnapshotRow | null>;
+    deleteSnapshot(envId: string, id: string): Promise<boolean>;
+    deleteSnapshots(envId: string): Promise<void>;
+
     suspend(envId: string, reason: string): Promise<void>;
     unsuspend(envId: string): Promise<boolean>;
     suspension(envId: string): Promise<{ reason: string; at: number } | null>;
@@ -206,6 +242,17 @@ CREATE TABLE IF NOT EXISTS suspensions (
     reason TEXT NOT NULL,
     at     INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    id         TEXT PRIMARY KEY,
+    env_id     TEXT NOT NULL,
+    name       TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    blocks     INTEGER NOT NULL,
+    fork_block TEXT NOT NULL,
+    overlay    TEXT NOT NULL,
+    chain      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshots_env ON snapshots (env_id, created_at DESC);
 `;
 
 const toAlert = (row: Record<string, unknown>): AlertRow => ({
@@ -400,6 +447,47 @@ class SqliteBackend implements Backend {
             .all(alertId, limit) as Array<Record<string, unknown>>).map(toDelivery);
     }
 
+    async copyTraces(fromEnv: string, toEnv: string) {
+        this.db.prepare(`
+            INSERT OR IGNORE INTO traces (env_id, hash, trace, diff)
+            SELECT ?, hash, trace, diff FROM traces WHERE env_id = ?`).run(toEnv, fromEnv);
+    }
+
+    async saveSnapshot(row: SnapshotRow) {
+        this.db.prepare(`
+            INSERT INTO snapshots (id, env_id, name, created_at, blocks, fork_block, overlay, chain)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+            .run(row.id, row.envId, row.name, row.createdAt, row.blocks, row.forkBlock, row.overlay, row.chain);
+    }
+
+    async listSnapshots(envId: string) {
+        return (this.db.prepare(`
+            SELECT id, env_id, name, created_at, blocks FROM snapshots
+            WHERE env_id = ? ORDER BY created_at DESC`).all(envId) as Array<Record<string, unknown>>)
+            .map((r) => ({
+                id: String(r.id), envId: String(r.env_id), name: String(r.name),
+                createdAt: Number(r.created_at), blocks: Number(r.blocks),
+            }));
+    }
+
+    async loadSnapshot(envId: string, id: string) {
+        const r = this.db.prepare("SELECT * FROM snapshots WHERE env_id = ? AND id = ?").get(envId, id) as
+            Record<string, unknown> | undefined;
+        return r ? {
+            id: String(r.id), envId: String(r.env_id), name: String(r.name), createdAt: Number(r.created_at),
+            blocks: Number(r.blocks), forkBlock: String(r.fork_block),
+            overlay: String(r.overlay), chain: String(r.chain),
+        } : null;
+    }
+
+    async deleteSnapshot(envId: string, id: string) {
+        return Number(this.db.prepare("DELETE FROM snapshots WHERE env_id = ? AND id = ?").run(envId, id).changes) > 0;
+    }
+
+    async deleteSnapshots(envId: string) {
+        this.db.prepare("DELETE FROM snapshots WHERE env_id = ?").run(envId);
+    }
+
     async suspend(envId: string, reason: string) {
         this.db.prepare(`
             INSERT INTO suspensions (env_id, reason, at) VALUES (?, ?, ?)
@@ -445,7 +533,7 @@ class SqliteBackend implements Backend {
 const SCHEMA_LOCK = 8_314_206;
 
 /** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 5;
 
 /**
  * Which row of `schema_meta` is the engine's.
@@ -534,6 +622,17 @@ CREATE TABLE IF NOT EXISTS suspensions (
     reason text NOT NULL,
     at     bigint NOT NULL
 );
+CREATE TABLE IF NOT EXISTS snapshots (
+    id         text PRIMARY KEY,
+    env_id     text NOT NULL,
+    name       text NOT NULL,
+    created_at bigint NOT NULL,
+    blocks     int NOT NULL,
+    fork_block text NOT NULL,
+    overlay    text NOT NULL,
+    chain      text NOT NULL
+);
+CREATE INDEX IF NOT EXISTS snapshots_env ON snapshots (env_id, created_at DESC);
 `;
 
 const fromPostgres = (row: Record<string, unknown>): SavedRow => ({
@@ -739,6 +838,48 @@ class PostgresBackend implements Backend {
             SELECT * FROM alert_deliveries WHERE alert_id = ${alertId}
             ORDER BY at DESC LIMIT ${limit}`;
         return rows.map(toDelivery);
+    }
+
+    async copyTraces(fromEnv: string, toEnv: string) {
+        await this.sql`
+            INSERT INTO traces (env_id, hash, trace, diff)
+            SELECT ${toEnv}, hash, trace, diff FROM traces WHERE env_id = ${fromEnv}
+            ON CONFLICT (env_id, hash) DO NOTHING`;
+    }
+
+    async saveSnapshot(row: SnapshotRow) {
+        await this.sql`
+            INSERT INTO snapshots (id, env_id, name, created_at, blocks, fork_block, overlay, chain)
+            VALUES (${row.id}, ${row.envId}, ${row.name}, ${row.createdAt}, ${row.blocks},
+                    ${row.forkBlock}, ${row.overlay}, ${row.chain})`;
+    }
+
+    async listSnapshots(envId: string) {
+        const rows = await this.sql`
+            SELECT id, env_id, name, created_at, blocks FROM snapshots
+            WHERE env_id = ${envId} ORDER BY created_at DESC`;
+        return rows.map((r) => ({
+            id: String(r.id), envId: String(r.env_id), name: String(r.name),
+            createdAt: Number(r.created_at), blocks: Number(r.blocks),
+        }));
+    }
+
+    async loadSnapshot(envId: string, id: string) {
+        const [ r ] = await this.sql`SELECT * FROM snapshots WHERE env_id = ${envId} AND id = ${id} LIMIT 1`;
+        return r ? {
+            id: String(r.id), envId: String(r.env_id), name: String(r.name), createdAt: Number(r.created_at),
+            blocks: Number(r.blocks), forkBlock: String(r.fork_block),
+            overlay: String(r.overlay), chain: String(r.chain),
+        } : null;
+    }
+
+    async deleteSnapshot(envId: string, id: string) {
+        const gone = await this.sql`DELETE FROM snapshots WHERE env_id = ${envId} AND id = ${id}`;
+        return gone.count > 0;
+    }
+
+    async deleteSnapshots(envId: string) {
+        await this.sql`DELETE FROM snapshots WHERE env_id = ${envId}`;
     }
 
     async suspend(envId: string, reason: string) {

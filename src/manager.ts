@@ -7,6 +7,8 @@
  * per sandbox does not.
  */
 import { reportError } from "./report.ts";
+import type { SnapshotSummary } from "./backend.ts";
+import type { SavedEnvironment } from "./store.ts";
 import { randomUUID } from "node:crypto";
 import { Environment } from "./environment.ts";
 import { Store, type EnvironmentSummary } from "./store.ts";
@@ -185,6 +187,105 @@ export class Manager {
     }
 
     /**
+     * The environment as it stands, written out first if it has changed.
+     *
+     * Clones and snapshots copy the stored row, so the row must be current:
+     * a transaction still only in memory would otherwise be left out of a copy
+     * that claims to be exact.
+     */
+    private async current(id: string): Promise<SavedEnvironment | null> {
+        const env = await this.get(id);
+        if (!env) return null;
+        await this.persist(id, env);
+        return await this.store.load(id);
+    }
+
+    /**
+     * A new environment that starts exactly where this one is.
+     *
+     * State, mined blocks, receipts and traces are copied; alerts and any
+     * suspension are not — a copy is a new thing that has not asked to be
+     * told about anything, and has not run out of anything. It shares the
+     * original's fork point and chain id, and from here on the two are
+     * independent.
+     */
+    async clone(sourceId: string, name?: string): Promise<{ id: string; env: Environment } | null> {
+        const saved = await this.current(sourceId);
+        if (!saved) return null;
+        const id = randomUUID().slice(0, 8);
+        const now = Date.now();
+        const written = await this.store.save({
+            ...saved,
+            id,
+            name: name ?? `${saved.name} (copy)`,
+            createdAt: now,
+            updatedAt: now,
+            // A row nobody has written yet.
+            revision: 0,
+        });
+        if (!written) throw new Error(`Could not create the copy of "${sourceId}".`);
+        await this.store.copyTraces(sourceId, id);
+        const env = await this.get(id);
+        if (!env) throw new Error(`The copy of "${sourceId}" did not load.`);
+        return { id, env };
+    }
+
+    /** Keeps the environment's state under a name, to come back to later. */
+    async snapshot(id: string, name: string): Promise<SnapshotSummary | null> {
+        const saved = await this.current(id);
+        if (!saved) return null;
+        const row = {
+            id: randomUUID().slice(0, 8),
+            envId: id,
+            name: name.trim().slice(0, 80) || `snapshot ${new Date().toISOString().slice(0, 19)}`,
+            createdAt: Date.now(),
+            blocks: saved.chain.blocks.length,
+            forkBlock: saved.forkBlock,
+            overlay: JSON.stringify(saved.overlay),
+            chain: JSON.stringify(saved.chain),
+        };
+        await this.store.saveSnapshot(row);
+        const { overlay: _overlay, chain: _chain, forkBlock: _forkBlock, ...summary } = row;
+        return summary;
+    }
+
+    listSnapshots(id: string): Promise<SnapshotSummary[]> {
+        return this.store.listSnapshots(id);
+    }
+
+    deleteSnapshot(id: string, snapshotId: string): Promise<boolean> {
+        return this.store.deleteSnapshot(id, snapshotId);
+    }
+
+    /**
+     * Puts the environment back to a snapshot.
+     *
+     * Written as an ordinary write of the environment's row — against the
+     * revision this process holds — so a restore that races a transaction on
+     * another replica loses like any other write would, instead of silently
+     * undoing it. The live copy is dropped, and the next request loads the
+     * restored one.
+     */
+    async restoreSnapshot(id: string, snapshotId: string): Promise<SnapshotSummary | null> {
+        const snapshot = await this.store.loadSnapshot(id, snapshotId);
+        if (!snapshot) return null;
+        const saved = await this.current(id);
+        if (!saved) return null;
+        const written = await this.store.save({
+            ...saved,
+            overlay: JSON.parse(snapshot.overlay),
+            chain: JSON.parse(snapshot.chain),
+            forkBlock: snapshot.forkBlock,
+            updatedAt: Date.now(),
+        });
+        if (!written) throw new StaleEnvironment(id);
+        this.live.delete(id);
+        this.suspensions.delete(id);
+        const { overlay: _overlay, chain: _chain, forkBlock: _forkBlock, ...summary } = snapshot;
+        return summary;
+    }
+
+    /**
      * Whether an environment has been told to stop, remembered briefly.
      *
      * Asked on every request and every socket message, so it cannot be a query
@@ -259,6 +360,7 @@ export class Manager {
         await tidy("traces", () => this.store.deleteTraces(id));
         await tidy("alerts", () => this.store.deleteAlerts(id));
         await tidy("suspension", () => this.store.unsuspend(id));
+        await tidy("snapshots", () => this.store.deleteSnapshots(id));
 
         return this.store.delete(id);
     }
