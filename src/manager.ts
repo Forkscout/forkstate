@@ -204,6 +204,7 @@ export class Manager {
     private measure(id: string, env: Environment): void {
         if (!this.meter) return;
         env.onUpstreamFetch = () => this.meter!.miss(id);
+        env.onForwarded = () => this.meter!.forward(id);
         env.usageReader = async (days) => {
             const since = new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
             const written = await this.store.readUsage(id, since);
@@ -211,13 +212,18 @@ export class Manager {
             // person is looking at is not up to half a minute behind.
             const live = this.meter!.unflushed(id);
             const total = written.reduce(
-                (sum, d) => ({ requests: sum.requests + d.requests, misses: sum.misses + d.misses }),
-                { requests: 0, misses: 0 });
+                (sum, d) => ({
+                    requests: sum.requests + d.requests,
+                    misses: sum.misses + d.misses,
+                    forwarded: sum.forwarded + d.forwarded,
+                }),
+                { requests: 0, misses: 0, forwarded: 0 });
             return {
                 days: written,
                 total: {
                     requests: total.requests + live.requests,
                     misses: total.misses + live.misses,
+                    forwarded: total.forwarded + live.forwarded,
                 },
                 pending: live,
             };

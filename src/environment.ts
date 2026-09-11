@@ -1576,8 +1576,20 @@ export class Environment {
 
     /** Reads that this environment has no answer for, and the parent chain does. */
     async passthrough<T>(method: string, params: unknown[]): Promise<T> {
+        // Counted before it is sent: a call that fails upstream was still a
+        // request somebody bills us for.
+        this.onForwarded?.(method);
         return rpc<T>(this.rpcUrl, method, params);
     }
+
+    /**
+     * Told about every call handed to the parent chain whole.
+     *
+     * This was the one path to the parent that nothing counted: state reads go
+     * through the metered cache, but a forwarded call went straight out, so a
+     * tool walking old blocks or receipts ran up a real bill while showing $0.
+     */
+    onForwarded: ((method: string) => void) | null = null;
 
     // ---- persistence --------------------------------------------------------
 

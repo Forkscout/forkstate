@@ -1938,8 +1938,8 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const meter = new Meter(null);
             meter.request("a", 3);
             meter.miss("b");
-            assert.deepEqual(meter.unflushed("a"), { requests: 3, misses: 0 });
-            assert.deepEqual(meter.unflushed("b"), { requests: 0, misses: 1 });
+            assert.deepEqual(meter.unflushed("a"), { requests: 3, misses: 0, forwarded: 0 });
+            assert.deepEqual(meter.unflushed("b"), { requests: 0, misses: 1, forwarded: 0 });
         });
 
         it("writes totals out, and adds to what is already there", async () => {
@@ -1956,6 +1956,56 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             assert.equal(rows.length, 1, "one row per day, added to rather than replaced");
             assert.equal(rows[0]!.requests, 7);
             assert.equal(rows[0]!.misses, 1);
+        });
+
+        it("counts a call handed to the parent whole, apart from a cold read", async () => {
+            /*
+             * The leak this closes. A block from before the fork is the parent's
+             * to answer, so it is forwarded — a paid request upstream that used
+             * to go out without anything counting it.
+             */
+            const meter = new Meter(null);
+            const env = await newEnv({ name: "meter-forward" });
+            const ok = okFor(env.id);
+            const held = (await manager.get(env.id))!;
+            held.onForwarded = () => meter.forward(env.id);
+            held.onUpstreamFetch = () => meter.miss(env.id);
+
+            const before = "0x" + (BigInt(env.forkBlock) - 5n).toString(16);
+            const block = await ok("eth_getBlockByNumber", [ before, false ]);
+            assert.ok(block?.hash, "the parent should have answered");
+            assert.equal(meter.unflushed(env.id).forwarded, 1);
+            assert.equal(meter.unflushed(env.id).misses, 0,
+                "and it is not a state read, so it is not counted as one");
+
+            // Answered here, from this fork's own chain: nothing went upstream.
+            await ok("eth_blockNumber", []);
+            await ok("eth_chainId", []);
+            assert.equal(meter.unflushed(env.id).forwarded, 1, "a local answer is not forwarded");
+        });
+
+        it("writes forwarded calls out with the rest of the day", async () => {
+            const meter = new Meter(store, 0);
+            const id = "meter-fwd-" + Math.random().toString(16).slice(2, 8);
+            meter.forward(id);
+            meter.forward(id);
+            meter.miss(id);
+            await meter.flush();
+            meter.forward(id);
+            await meter.flush();
+
+            const [ row ] = await store.readUsage(id, "2000-01-01");
+            assert.equal(row!.forwarded, 3, "added to, not replaced");
+            assert.equal(row!.misses, 1);
+        });
+
+        it("reports forwarded calls over RPC", async () => {
+            const env = await newEnv({ name: "meter-fwd-rpc" });
+            const ok = okFor(env.id);
+            const before = "0x" + (BigInt(env.forkBlock) - 3n).toString(16);
+            await ok("eth_getBlockByNumber", [ before, false ]);
+            const usage = await ok("forkstate_usage", [ 30 ]);
+            assert.ok(usage.total.forwarded >= 1, "the forwarded block should be in the total");
         });
 
         it("does not lose usage when the write fails", async () => {

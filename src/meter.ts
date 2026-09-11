@@ -21,6 +21,15 @@ export interface Usage {
     requests: number;
     /** Reads that fell through to the parent chain. The number that costs money. */
     misses: number;
+    /**
+     * Calls handed to the parent chain whole — a block from before the fork, an
+     * old receipt, a method this engine does not implement.
+     *
+     * Kept apart from misses because they are a different thing to the person
+     * paying: a miss is state their code needed, a forwarded call is history
+     * their tools asked about. Both are a paid request upstream.
+     */
+    forwarded: number;
 }
 
 export interface UsageSink {
@@ -54,27 +63,34 @@ export class Meter {
         this.entry(envId, at).misses += 1;
     }
 
+    /** One call passed to the parent chain as it was. */
+    forward(envId: string, at = Date.now()): void {
+        this.entry(envId, at).forwarded += 1;
+    }
+
     private entry(envId: string, at: number): Usage {
         const day = today(at);
         const key = `${envId}|${day}`;
         let found = this.pending.get(key);
         if (!found) {
-            found = { envId, day, requests: 0, misses: 0 };
+            found = { envId, day, requests: 0, misses: 0, forwarded: 0 };
             this.pending.set(key, found);
         }
         return found;
     }
 
     /** What has not been written out yet, for a caller that wants the live number. */
-    unflushed(envId: string): { requests: number; misses: number } {
+    unflushed(envId: string): { requests: number; misses: number; forwarded: number } {
         let requests = 0;
         let misses = 0;
+        let forwarded = 0;
         for (const entry of this.pending.values()) {
             if (entry.envId !== envId) continue;
             requests += entry.requests;
             misses += entry.misses;
+            forwarded += entry.forwarded;
         }
-        return { requests, misses };
+        return { requests, misses, forwarded };
     }
 
     async flush(): Promise<void> {
@@ -94,6 +110,7 @@ export class Meter {
                     const held = this.entry(entry.envId, Date.parse(entry.day + "T00:00:00Z"));
                     held.requests += entry.requests;
                     held.misses += entry.misses;
+                    held.forwarded += entry.forwarded;
                 }
                 console.error("could not write usage:", error);
             } finally {

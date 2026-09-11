@@ -41,6 +41,15 @@ export interface SavedRow {
     revision: number;
 }
 
+/** One environment's totals for one day. */
+export interface UsageRow {
+    envId: string;
+    day: string;
+    requests: number;
+    misses: number;
+    forwarded: number;
+}
+
 /** A rule someone set on an environment, and where to tell them about it. */
 export interface AlertRow {
     id: string;
@@ -90,8 +99,8 @@ export interface Backend {
      * trace the environment has ever produced each time anything happens.
      */
     /** Adds to each environment's running totals for a day. */
-    addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>): Promise<void>;
-    readUsage(envId: string, since: string): Promise<Array<{ day: string; requests: number; misses: number }>>;
+    addUsage(entries: UsageRow[]): Promise<void>;
+    readUsage(envId: string, since: string): Promise<Array<Omit<UsageRow, "envId">>>;
 
     saveTrace(envId: string, hash: string, trace: string, diff: string): Promise<void>;
     loadTrace(envId: string, hash: string): Promise<{ trace: string; diff: string } | null>;
@@ -150,10 +159,11 @@ CREATE TABLE IF NOT EXISTS traces (
     PRIMARY KEY (env_id, hash)
 );
 CREATE TABLE IF NOT EXISTS usage (
-    env_id   TEXT NOT NULL,
-    day      TEXT NOT NULL,
-    requests INTEGER NOT NULL DEFAULT 0,
-    misses   INTEGER NOT NULL DEFAULT 0,
+    env_id    TEXT NOT NULL,
+    day       TEXT NOT NULL,
+    requests  INTEGER NOT NULL DEFAULT 0,
+    misses    INTEGER NOT NULL DEFAULT 0,
+    forwarded INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (env_id, day)
 );
 CREATE TABLE IF NOT EXISTS alerts (
@@ -246,6 +256,11 @@ class SqliteBackend implements Backend {
         if (!columns.has("revision")) {
             db.exec("ALTER TABLE environments ADD COLUMN revision INTEGER NOT NULL DEFAULT 0");
         }
+        const usageColumns = new Set((db.prepare("PRAGMA table_info(usage)").all() as
+            Array<{ name: string }>).map((c) => c.name));
+        if (!usageColumns.has("forwarded")) {
+            db.exec("ALTER TABLE usage ADD COLUMN forwarded INTEGER NOT NULL DEFAULT 0");
+        }
         return new SqliteBackend(db);
     }
 
@@ -283,19 +298,21 @@ class SqliteBackend implements Backend {
         return Number(this.db.prepare("DELETE FROM environments WHERE id = ?").run(id).changes) > 0;
     }
 
-    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>) {
+    async addUsage(entries: UsageRow[]) {
         const statement = this.db.prepare(`
-            INSERT INTO usage (env_id, day, requests, misses) VALUES (?, ?, ?, ?)
+            INSERT INTO usage (env_id, day, requests, misses, forwarded) VALUES (?, ?, ?, ?, ?)
             ON CONFLICT(env_id, day) DO UPDATE SET
-                requests = usage.requests + excluded.requests,
-                misses   = usage.misses   + excluded.misses`);
-        for (const e of entries) statement.run(e.envId, e.day, e.requests, e.misses);
+                requests  = usage.requests  + excluded.requests,
+                misses    = usage.misses    + excluded.misses,
+                forwarded = usage.forwarded + excluded.forwarded`);
+        for (const e of entries) statement.run(e.envId, e.day, e.requests, e.misses, e.forwarded);
     }
 
     async readUsage(envId: string, since: string) {
-        return this.db.prepare(
-            "SELECT day, requests, misses FROM usage WHERE env_id = ? AND day >= ? ORDER BY day")
-            .all(envId, since) as Array<{ day: string; requests: number; misses: number }>;
+        return this.db.prepare(`
+            SELECT day, requests, misses, forwarded FROM usage
+            WHERE env_id = ? AND day >= ? ORDER BY day`)
+            .all(envId, since) as Array<Omit<UsageRow, "envId">>;
     }
 
     async saveTrace(envId: string, hash: string, trace: string, diff: string) {
@@ -395,7 +412,7 @@ class SqliteBackend implements Backend {
 const SCHEMA_LOCK = 8_314_206;
 
 /** Bumped whenever POSTGRES_SCHEMA changes, so a later addition is not skipped. */
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 /**
  * Which row of `schema_meta` is the engine's.
@@ -450,6 +467,11 @@ CREATE TABLE IF NOT EXISTS upstream (
     value text NOT NULL,
     seen  bigint NOT NULL
 );
+/*
+ * Added rather than declared, like revision: a deployment already has this
+ * table. Existing days start at 0, which is true — nothing counted them.
+ */
+ALTER TABLE usage ADD COLUMN IF NOT EXISTS forwarded bigint NOT NULL DEFAULT 0;
 CREATE TABLE IF NOT EXISTS alerts (
     id            text PRIMARY KEY,
     env_id        text NOT NULL,
@@ -585,26 +607,29 @@ class PostgresBackend implements Backend {
         return (await this.sql`DELETE FROM environments WHERE id = ${id}`).count > 0;
     }
 
-    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>) {
+    async addUsage(entries: UsageRow[]) {
         if (entries.length === 0) return;
         const rows = entries.map((e) => ({
             env_id: e.envId, day: e.day, requests: e.requests, misses: e.misses,
+            forwarded: e.forwarded,
         }));
         // One statement for the batch: the meter exists to stop paying for round
         // trips, so it should not spend one per environment per flush.
         await this.sql`
-            INSERT INTO usage ${this.sql(rows, "env_id", "day", "requests", "misses")}
+            INSERT INTO usage ${this.sql(rows, "env_id", "day", "requests", "misses", "forwarded")}
             ON CONFLICT (env_id, day) DO UPDATE SET
-                requests = usage.requests + EXCLUDED.requests,
-                misses   = usage.misses   + EXCLUDED.misses`;
+                requests  = usage.requests  + EXCLUDED.requests,
+                misses    = usage.misses    + EXCLUDED.misses,
+                forwarded = usage.forwarded + EXCLUDED.forwarded`;
     }
 
     async readUsage(envId: string, since: string) {
         const rows = await this.sql`
-            SELECT day, requests, misses FROM usage
+            SELECT day, requests, misses, forwarded FROM usage
             WHERE env_id = ${envId} AND day >= ${since} ORDER BY day`;
         return rows.map((r) => ({
             day: String(r.day), requests: Number(r.requests), misses: Number(r.misses),
+            forwarded: Number(r.forwarded ?? 0),
         }));
     }
 

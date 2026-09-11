@@ -5,7 +5,7 @@
  * balance — so it is stored whole rather than as a table of writes. What that
  * buys is that restoring an environment is one read and no assembly.
  */
-import type { Backend, SavedRow } from "./backend.ts";
+import type { Backend, SavedRow, UsageRow } from "./backend.ts";
 import type { Overlay } from "./overlay.ts";
 import type { Chain } from "./chain.ts";
 
@@ -102,11 +102,11 @@ export class Store {
     }
 
     /** Running totals per environment per day. Written in batches, never per read. */
-    async addUsage(entries: Array<{ envId: string; day: string; requests: number; misses: number }>): Promise<void> {
+    async addUsage(entries: UsageRow[]): Promise<void> {
         await this.backend.addUsage(entries);
     }
 
-    async readUsage(envId: string, since: string): Promise<Array<{ day: string; requests: number; misses: number }>> {
+    async readUsage(envId: string, since: string): Promise<Array<Omit<UsageRow, "envId">>> {
         return this.backend.readUsage(envId, since);
     }
 
