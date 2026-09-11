@@ -1823,6 +1823,89 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("what the EVM thinks the block is", () => {
+        // TIMESTAMP -> slot 0, NUMBER -> slot 1, then stop.
+        const RECORDER = "0x426000554360015500";
+        // Returns TIMESTAMP, then NUMBER, as two words.
+        const READER = "0x4260005243602052604060" + "00f3";
+        const word = (hex: string) => BigInt(hex === "0x" ? 0 : hex);
+
+        it("gives a transaction the timestamp and number its block reports", async () => {
+            /*
+             * The bug this pins: every execution ran without a block, so the
+             * EVM used an empty one — timestamp 0, number 0 — while the header
+             * said the right thing. A contract that stored when something was
+             * registered stored 1970.
+             */
+            const env = await newEnv({ name: "block-context-tx" });
+            const ok = okFor(env.id);
+            const AT = "0x00000000000000000000000000000000000c1ce0";
+            await ok("anvil_setCode", [ AT, RECORDER ]);
+
+            const hash = await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]);
+            const receipt = await ok("eth_getTransactionReceipt", [ hash ]);
+            const block = await ok("eth_getBlockByNumber", [ receipt.blockNumber, false ]);
+
+            const seenTime = word(await ok("eth_getStorageAt", [ AT, "0x0", "latest" ]));
+            const seenNumber = word(await ok("eth_getStorageAt", [ AT, "0x1", "latest" ]));
+            assert.notEqual(seenTime, 0n, "block.timestamp must not be 0");
+            assert.equal(seenTime, BigInt(block.timestamp), "and must be exactly the header's");
+            assert.equal(seenNumber, BigInt(block.number), "block.number too");
+        });
+
+        it("gives eth_call the block a transaction sent now would land in", async () => {
+            const env = await newEnv({ name: "block-context-call" });
+            const ok = okFor(env.id);
+            const AT = "0x00000000000000000000000000000000000c1ce1";
+            const answer: string = await ok("eth_call", [
+                { to: AT }, "latest", { [AT]: { code: READER } },
+            ]);
+            const time = BigInt("0x" + answer.slice(2, 66));
+            const number = BigInt("0x" + answer.slice(66, 130));
+            const height = BigInt(await ok("eth_blockNumber", []));
+            const now = BigInt(Math.floor(Date.now() / 1000));
+
+            assert.equal(number, height + 1n, "the pending block, as anvil answers");
+            assert.ok(time >= now - 5n && time <= now + 5n, `block.timestamp ${time} should be about now`);
+        });
+
+        it("moves block.timestamp when time is moved", async () => {
+            const env = await newEnv({ name: "block-context-time" });
+            const ok = okFor(env.id);
+            const AT = "0x00000000000000000000000000000000000c1ce2";
+            await ok("anvil_setCode", [ AT, RECORDER ]);
+
+            await ok("evm_increaseTime", [ 86_400 ]);
+            await ok("eth_sendTransaction", [ { from: SIGNER, to: AT } ]);
+            const seen = word(await ok("eth_getStorageAt", [ AT, "0x0", "latest" ]));
+            const now = BigInt(Math.floor(Date.now() / 1000));
+            assert.ok(seen >= now + 86_400n - 5n, "a day ahead, as asked");
+        });
+
+        it("puts a bundle's transactions in one block", async () => {
+            const env = await newEnv({ name: "block-context-bundle" });
+            const ok = okFor(env.id);
+            const AT = "0x00000000000000000000000000000000000c1ce3";
+            const bundle = await ok("forkstate_simulateBundle", [ {
+                overrides: { [AT]: { code: READER } },
+                transactions: [ { from: SIGNER, to: AT }, { from: SIGNER, to: AT } ],
+            } ]);
+            const [ first, second ] = bundle.results;
+            assert.notEqual(BigInt("0x" + first.returnValue.slice(66, 130)), 0n);
+            assert.equal(first.returnValue, second.returnValue, "same number, same time");
+        });
+
+        it("never lets a block's time go backwards", async () => {
+            const env = await newEnv({ name: "block-context-order" });
+            const ok = okFor(env.id);
+            await ok("anvil_mine", [ "0x3" ]);
+            const height = Number(BigInt(await ok("eth_blockNumber", [])));
+            const times = await Promise.all([ height - 2, height - 1, height ].map(async (n) =>
+                BigInt((await ok("eth_getBlockByNumber", [ "0x" + n.toString(16), false ])).timestamp)));
+            assert.ok(times[0]! <= times[1]! && times[1]! <= times[2]!, `timestamps ${times.join(", ")}`);
+        });
+    });
+
     describe("two replicas on one store", () => {
         /*
          * A second manager over the same store is what a second replica is.

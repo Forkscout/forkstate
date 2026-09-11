@@ -17,6 +17,9 @@ import { keccak_256 } from "@noble/hashes/sha3.js";
 import { Account, Address, bytesToHex, createAddressFromString, hexToBytes, utf8ToBytes } from "@ethereumjs/util";
 import type { VM } from "@ethereumjs/vm";
 
+/** The block the EVM reads `block.*` from, as its own call options define it. */
+type EvmBlock = NonNullable<Parameters<VM["evm"]["runCall"]>[0]["block"]>;
+
 import { emptyOverlay, normaliseAddress, normaliseWord, overlaySize, type Overlay } from "./overlay.ts";
 import { Chain, type StoredBlock, type StoredTx } from "./chain.ts";
 import { attachTracer, type Trace, type TraceOptions } from "./tracer.ts";
@@ -559,6 +562,10 @@ export class Environment {
                 data: callData(request),
                 value: request.value ? BigInt(request.value) : 0n,
                 gasLimit: request.gas ? BigInt(request.gas) : DEFAULT_GAS,
+                // The block a transaction sent now would land in, as anvil does:
+                // an estimate or a simulation should see the time and number
+                // the real thing will.
+                block: this.blockContext(this.nextBlock()),
             });
             const exec = result.execResult;
             const reverted = Boolean(exec.exceptionError);
@@ -655,8 +662,10 @@ export class Environment {
 
             const results: BundleResult[] = [];
             let total = 0n;
+            // One block for all of them: a bundle is transactions landing together.
+            const block = this.blockContext(this.nextBlock());
             for (const [ index, request ] of transactions.entries()) {
-                const result = await this.simulateOne(index, request, options);
+                const result = await this.simulateOne(index, request, options, block);
                 total += BigInt(result.gasUsed);
                 results.push(result);
             }
@@ -674,7 +683,7 @@ export class Environment {
 
     /** One transaction of a bundle, on top of whatever the ones before it left. */
     private async simulateOne(
-        index: number, request: CallRequest, options: BundleOptions,
+        index: number, request: CallRequest, options: BundleOptions, block: EvmBlock,
     ): Promise<BundleResult> {
         const from = normaliseAddress(request.from ?? ANONYMOUS);
         const sender = createAddressFromString(from);
@@ -724,6 +733,7 @@ export class Environment {
                     data: callData(request),
                     value,
                     gasLimit: request.gas ? BigInt(request.gas) : DEFAULT_GAS,
+                    block,
                 });
             } finally {
                 // Off before anything else can throw, or it stays attached to
@@ -829,6 +839,9 @@ export class Environment {
         // Traced as it runs. A transaction is the one execution that cannot be
         // reproduced later: state moves on, so a replay would describe something
         // that never happened.
+        // Fixed before it runs and handed to the block it is mined into, so the
+        // time the contract sees and the time the header says are one value.
+        const next = this.nextBlock();
         const stopTracing = attachTracer(this.vm.evm as never, { storage: true });
         this.capturing = { accounts: {}, storage: {} };
         let result;
@@ -839,6 +852,7 @@ export class Environment {
                 data: hexToBytes(data as `0x${string}`),
                 value,
                 gasLimit,
+                block: this.blockContext(next),
             });
         } finally {
             this.pendingTrace = stopTracing();
@@ -916,7 +930,7 @@ export class Environment {
             revertData: reverted ? bytesToHex(exec.returnValue) : null,
         };
 
-        this.mineBlock([ tx ], gasUsed);
+        this.mineBlock([ tx ], gasUsed, next.timestamp);
         // Written once, here, where the trace is complete and will never change
         // again. A failure to archive must not fail the transaction that has
         // already run, so it is reported and left at that.
@@ -1047,11 +1061,59 @@ export class Environment {
         return bytesToHex(keccak_256(utf8ToBytes(material)));
     }
 
-    private mineBlock(txs: StoredTx[], gasUsed: bigint): void {
+    /**
+     * The block the next transaction will land in: its number, and its time.
+     *
+     * Never earlier than the block before it. A clock that steps back, or an
+     * evm_snapshot restored after time moved on, would otherwise produce a
+     * chain whose timestamps go backwards, which every contract with a
+     * deadline treats as impossible.
+     */
+    private nextBlock(): { number: number; timestamp: number } {
+        const now = Math.floor(Date.now() / 1000) + this.timeOffset;
+        return {
+            number: this.chain.height + 1,
+            timestamp: Math.max(now, this.chain.latest()?.timestamp ?? 0),
+        };
+    }
+
+    /**
+     * The block as the EVM sees it — `block.timestamp`, `block.number` and the
+     * rest.
+     *
+     * Every execution used to run without one, and the EVM then uses an empty
+     * block: timestamp 0, number 0. A contract that recorded when something
+     * happened recorded 1970; a deadline check always passed; a time lock was
+     * always open. The header this environment reports for the block said the
+     * right thing the whole time, so nothing looked wrong until someone read
+     * the value the contract had actually stored.
+     *
+     * Every field here matches what the mined block's header reports: the same
+     * miner, a base fee of zero, a zero mix hash as prevrandao, and the minimum
+     * blob gas price that an excess blob gas of zero implies.
+     */
+    private blockContext(next: { number: number; timestamp: number }): EvmBlock {
+        return {
+            header: {
+                number: BigInt(next.number),
+                timestamp: BigInt(next.timestamp),
+                coinbase: createAddressFromString(ANONYMOUS),
+                difficulty: 0n,
+                prevRandao: new Uint8Array(32),
+                gasLimit: DEFAULT_GAS,
+                baseFeePerGas: 0n,
+                getBlobGasPrice: () => 1n,
+            },
+        };
+    }
+
+    private mineBlock(txs: StoredTx[], gasUsed: bigint, at?: number): void {
         this.revision++;
         const parent = this.chain.latest();
         const number = this.chain.height + 1;
-        const timestamp = Math.floor(Date.now() / 1000) + this.timeOffset;
+        // The time the transaction already ran at, when there was one, so its
+        // block.timestamp and its block's header can never be a second apart.
+        const timestamp = at ?? this.nextBlock().timestamp;
         const hash = bytesToHex(keccak_256(utf8ToBytes(`block:${this.chainId}:${number}:${timestamp}`)));
 
         const block: StoredBlock = {
