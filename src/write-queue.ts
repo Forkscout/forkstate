@@ -21,7 +21,7 @@
  * since nothing it does moves the environment's version.
  */
 export const MUTATES =
-    /^(eth_sendTransaction|eth_sendRawTransaction|anvil_|evm_|forkstate_(setChainId|setTokenBalance|sync|followHead|simulateBundle))/;
+    /^(eth_sendTransaction|eth_sendRawTransaction|eth_sendUserOperation|anvil_|evm_|forkstate_(setChainId|setTokenBalance|setPrice|resetPrice|sync|followHead|simulateBundle))/;
 
 export const mutating = (payload: unknown): boolean => {
     const one = (call: unknown) => MUTATES.test(String((call as { method?: unknown })?.method ?? ""));

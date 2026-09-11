@@ -14,6 +14,11 @@ import { submitVerification, verificationStatus, type VerifyRequest } from "./ve
 import type { StoredBlock, StoredTx } from "./chain.ts";
 import { checkUrl, type Alerts, type Criteria } from "./alerts.ts";
 import type { Log } from "./types.ts";
+import { resetPrice, setPrice } from "./oracle.ts";
+import {
+    describeOperation, describeReceipt, estimateUserOperationGas, findUserOperation, sendUserOperation,
+    supportedEntryPoints, UserOpError,
+} from "./bundler.ts";
 
 interface RpcRequest {
     jsonrpc?: string;
@@ -668,6 +673,49 @@ export async function handleRpc(
                 return reply({ from: hex(moved.from), to: hex(moved.to), advanced: moved.advanced });
             }
             // Give an address a token balance by finding the slot the token uses.
+            // ---- ERC-4337: a bundler, against the EntryPoints the parent already has
+            case "eth_supportedEntryPoints":
+                return reply(await supportedEntryPoints(env));
+            case "eth_sendUserOperation":
+            case "eth_estimateUserOperationGas":
+            case "eth_getUserOperationReceipt":
+            case "eth_getUserOperationByHash": {
+                try {
+                    if (method === "eth_sendUserOperation") {
+                        return reply((await sendUserOperation(env, params[0], params[1])).hash);
+                    }
+                    if (method === "eth_estimateUserOperationGas") {
+                        return reply(await estimateUserOperationGas(env, params[0], params[1]));
+                    }
+                    const found = findUserOperation(env, params[0]);
+                    if (!found) return reply(null);
+                    if (method === "eth_getUserOperationByHash") {
+                        const described = describeOperation(found);
+                        return reply(described && {
+                            ...described,
+                            blockHash: found.tx.blockHash ?? null,
+                            blockNumber: "0x" + found.tx.blockNumber.toString(16),
+                        });
+                    }
+                    return reply({ ...describeReceipt(found), receipt: receiptToRpc(found.tx) });
+                } catch (error) {
+                    if (error instanceof UserOpError) return fail(error.message, error.code);
+                    throw error;
+                }
+            }
+
+            // A Chainlink feed answering with a price of your choosing.
+            case "forkstate_setPrice":
+            case "forkstate_resetPrice": {
+                try {
+                    if (method === "forkstate_resetPrice") return reply({ reset: await resetPrice(env, String(params[0])) });
+                    if (params[1] === undefined) return fail("forkstate_setPrice takes a feed and a price.", -32602);
+                    return reply(await setPrice(env, String(params[0]), params[1]));
+                } catch (error) {
+                    return fail(error instanceof Error ? error.message : String(error));
+                }
+            }
+
             case "forkstate_setTokenBalance": {
                 const token = String(params[0]);
 

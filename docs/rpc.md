@@ -35,6 +35,49 @@ below the new fork point the parent answers instead.
 
 ## Beyond the standard
 
+### ERC-4337 user operations
+
+Every environment is also a bundler, speaking the standard methods (ERC-7769)
+against the real EntryPoint contracts on the parent chain: v0.8
+(`0x4337084D…Ff108`), v0.7 (`0x00000000…7da032`) and v0.6 (`0x5FF137D4…2789`).
+
+| Method | |
+| --- | --- |
+| `eth_supportedEntryPoints` | The EntryPoints deployed on the parent |
+| `eth_sendUserOperation(op, entryPoint)` | Simulates, then runs it in its own block; answers the operation hash |
+| `eth_estimateUserOperationGas(op, entryPoint)` | Limits to use. The call is estimated for real; verification gets a generous fixed limit, since it needs the signature being estimated for |
+| `eth_getUserOperationReceipt(hash)` | Success, gas paid, its logs, and the transaction receipt |
+| `eth_getUserOperationByHash(hash)` | The operation, read back from the bundle that carried it |
+
+An operation the EntryPoint would reject is refused before anything is mined,
+with its reason as the message (`AA24 signature error`) and ERC-7769's codes:
+`-32507` for a signature, `-32501` for a paymaster, `-32503` for a time range,
+`-32500` for anything else. Bundles are sent by
+`0x4337000000000000000000000000000000004337`, which is paid what each
+operation pays.
+
+### `forkstate_setPrice` and `forkstate_resetPrice`
+
+Makes a Chainlink-style price feed report a price of your choosing.
+
+```json
+{"method":"forkstate_setPrice","params":["0x5f4eC3Df9cbd43714FE2740f5E3616155c5b8419","1850.25"]}
+```
+
+The price is in the feed's own units (its `decimals()`), or `0x` hex for the raw
+answer; negative prices are allowed. The answer is
+`{ feed, answer, decimals, roundId }`.
+
+`latestRoundData`, `latestAnswer`, `latestTimestamp`, `latestRound` and
+`getRoundData` for the new round answer with the price. `updatedAt` is the
+current block's time whenever it is read, so staleness checks pass. The round
+id is one past the real latest. Every other call — `decimals()`,
+`description()`, `aggregator()` — runs the feed's original code against its own
+storage, delegated from the replacement.
+
+`forkstate_resetPrice(feed)` puts the real feed back and answers `{ reset }`.
+
+
 ### `eth_call` with state overrides
 
 The third parameter is Geth's, and is a map of address to the fields to pretend

@@ -1702,6 +1702,218 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
         });
     });
 
+    describe("a bundler for smart accounts", () => {
+        const EP = {
+            "0.8": "0x4337084D9E255Ff0702461CF8895CE9E3b5Ff108",
+            "0.7": "0x0000000071727De22E5E9d8BAf0edAc6f37da032",
+            "0.6": "0x5FF137D4b0FDCD49DcA30c7CF57E578a026d2789",
+        } as const;
+        const BUNDLER = "0x4337000000000000000000000000000000004337";
+
+        /**
+         * The smallest account an EntryPoint will accept: validateUserOp (either
+         * version's) pays what it is asked to and returns `validation`; any
+         * other call stores its first argument in slot 1, so a test can see
+         * the operation ran.
+         */
+        async function account(ok: ReturnType<typeof okFor>, at: string, validation = 0) {
+            const { assemble } = await import("../src/oracle.ts");
+            const code = assemble([
+                "600035", "60e01c",
+                "80", "6319822f7c", "14", { jump: "validate" }, "57",
+                "80", "633a871cdd", "14", { jump: "validate" }, "57",
+                "600435", "600155", "00",
+                { label: "validate" },
+                "6000", "6000", "6000", "6000", "604435", "33", "5a", "f1", "50",
+                "60" + validation.toString(16).padStart(2, "0"), "600052", "60206000f3",
+            ]);
+            await ok("anvil_setCode", [ at, "0x" + code ]);
+            return at;
+        }
+
+        const operation = (version: keyof typeof EP, sender: string, extra: Record<string, string> = {}) => ({
+            sender,
+            nonce: "0x0",
+            callData: "0xdeadbeef" + word(42n),
+            callGasLimit: "0x30000",
+            verificationGasLimit: "0x30000",
+            preVerificationGas: "0xc350",
+            maxFeePerGas: "0x0",
+            maxPriorityFeePerGas: "0x0",
+            signature: "0x",
+            ...(version === "0.6" ? { initCode: "0x", paymasterAndData: "0x" } : {}),
+            ...extra,
+        });
+
+        it("lists the EntryPoints the parent chain has", async () => {
+            const env = await newEnv({ name: "aa-entrypoints" });
+            assert.deepEqual(await okFor(env.id)("eth_supportedEntryPoints"), [ EP["0.8"], EP["0.7"], EP["0.6"] ]);
+        });
+
+        for (const version of [ "0.7", "0.6", "0.8" ] as const) {
+            it(`runs a v${version} operation, and finds it again by hash`, async () => {
+                const env = await newEnv({ name: `aa-send-${version}` });
+                const ok = okFor(env.id);
+                const sender = await account(ok, "0x00000000000000000000000000000000000aa07" + version.slice(-1));
+                const op = operation(version, sender);
+                const hash = await ok("eth_sendUserOperation", [ op, EP[version] ]);
+                assert.match(hash, /^0x[0-9a-f]{64}$/);
+                assert.equal(await ok("eth_getStorageAt", [ sender, "0x1", "latest" ]), "0x" + word(42n), "the call ran");
+
+                const receipt = await ok("eth_getUserOperationReceipt", [ hash ]);
+                assert.equal(receipt.success, true);
+                assert.equal(receipt.sender, sender.toLowerCase());
+                assert.equal(receipt.nonce, "0x0");
+                assert.equal(receipt.entryPoint.toLowerCase(), EP[version].toLowerCase());
+                assert.equal(receipt.receipt.status, "0x1");
+                assert.equal(receipt.receipt.from.toLowerCase(), BUNDLER);
+
+                const found = await ok("eth_getUserOperationByHash", [ hash ]);
+                assert.equal(found.userOperation.callData, op.callData);
+                assert.equal(found.userOperation.sender, sender.toLowerCase());
+                assert.equal(found.transactionHash, receipt.receipt.transactionHash);
+
+                // The nonce moved, so the next one is 1.
+                await ok("eth_sendUserOperation", [ { ...op, nonce: "0x1" }, EP[version] ]);
+            });
+        }
+
+        it("pays the bundler what the operation pays", async () => {
+            const env = await newEnv({ name: "aa-fees" });
+            const ok = okFor(env.id);
+            const sender = await account(ok, "0x00000000000000000000000000000000000aa0f1");
+            await ok("anvil_setBalance", [ sender, "0xde0b6b3a7640000" ]);
+            const before = BigInt(await ok("eth_getBalance", [ BUNDLER, "latest" ]));
+            const hash = await ok("eth_sendUserOperation", [
+                operation("0.7", sender, { maxFeePerGas: "0x3b9aca00", maxPriorityFeePerGas: "0x3b9aca00" }), EP["0.7"],
+            ]);
+            const receipt = await ok("eth_getUserOperationReceipt", [ hash ]);
+            assert.ok(BigInt(receipt.actualGasCost) > 0n);
+            assert.equal(BigInt(await ok("eth_getBalance", [ BUNDLER, "latest" ])) - before, BigInt(receipt.actualGasCost));
+        });
+
+        it("refuses what the EntryPoint would reject, without mining anything", async () => {
+            const env = await newEnv({ name: "aa-refused" });
+            const ok = okFor(env.id);
+            const call = rpcFor(env.id);
+            const liar = await account(ok, "0x00000000000000000000000000000000000aa0e1", 1);
+            const height = await ok("eth_blockNumber");
+
+            const bad = await call("eth_sendUserOperation", [ operation("0.7", liar), EP["0.7"] ]) as any;
+            assert.equal(bad.error.code, -32507);
+            assert.match(bad.error.message, /AA24/);
+
+            const honest = await account(ok, "0x00000000000000000000000000000000000aa0e2");
+            const early = await call("eth_sendUserOperation", [ operation("0.7", honest, { nonce: "0x5" }), EP["0.7"] ]) as any;
+            assert.equal(early.error.code, -32500);
+            assert.match(early.error.message, /AA25/);
+
+            const nowhere = await call("eth_sendUserOperation", [ operation("0.7", honest), DEAD ]) as any;
+            assert.equal(nowhere.error.code, -32602);
+
+            assert.equal(await ok("eth_blockNumber"), height, "a refused operation is not a reverted transaction");
+        });
+
+        it("estimates limits the operation then succeeds with", async () => {
+            const env = await newEnv({ name: "aa-estimate" });
+            const ok = okFor(env.id);
+            const sender = await account(ok, "0x00000000000000000000000000000000000aa0a1");
+            const op = operation("0.7", sender);
+            const limits = await ok("eth_estimateUserOperationGas", [ op, EP["0.7"] ]);
+            for (const field of [ "preVerificationGas", "verificationGasLimit", "callGasLimit" ]) {
+                assert.match(limits[field], /^0x[0-9a-f]+$/, field);
+            }
+            const hash = await ok("eth_sendUserOperation", [ { ...op, ...limits }, EP["0.7"] ]);
+            assert.equal((await ok("eth_getUserOperationReceipt", [ hash ])).success, true);
+        });
+
+        it("still finds an operation after a restart, and nothing for a hash it never saw", async () => {
+            const env = await newEnv({ name: "aa-restart" });
+            const ok = okFor(env.id);
+            const sender = await account(ok, "0x00000000000000000000000000000000000aa0b1");
+            const hash = await ok("eth_sendUserOperation", [ operation("0.7", sender), EP["0.7"] ]);
+            await manager.evict(env.id);
+            assert.equal((await ok("eth_getUserOperationReceipt", [ hash ])).success, true);
+            assert.equal(await ok("eth_getUserOperationReceipt", [ "0x" + "ab".repeat(32) ]), null);
+        });
+    });
+
+    describe("pretending an oracle's price", () => {
+        // Chainlink BNB / USD on BNB Chain: a proxy in front of an aggregator, 8 decimals.
+        const FEED = "0x0567F2323251f0Aab15c8dFb1967E4e8A7D42aeE";
+        const words = (hex: string) => (hex.slice(2).match(/.{64}/g) ?? []).map((w) => BigInt("0x" + w));
+
+        it("answers the price questions with the price given, as of now", async () => {
+            const env = await newEnv({ name: "oracle-set" });
+            const ok = okFor(env.id);
+            const [ realRound ] = words(await ok("eth_call", [ { to: FEED, data: "0xfeaf968c" }, "latest" ]));
+
+            const set = await ok("forkstate_setPrice", [ FEED, "612.5" ]);
+            assert.equal(set.decimals, 8);
+            assert.equal(set.answer, "61250000000");
+
+            const [ round, answer, startedAt, updatedAt, answeredIn ] =
+                words(await ok("eth_call", [ { to: FEED, data: "0xfeaf968c" }, "latest" ]));
+            assert.equal(answer, 61250000000n);
+            assert.equal(round, realRound! + 1n, "a new round, for consumers that insist on one");
+            assert.equal(answeredIn, round);
+            const head = await ok("eth_getBlockByNumber", [ "latest", false ]);
+            assert.ok(updatedAt! >= BigInt(head.timestamp) && startedAt === updatedAt, "fresh, so staleness checks pass");
+
+            assert.equal(BigInt(await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ])), 61250000000n);
+            assert.equal(BigInt(await ok("eth_call", [ { to: FEED, data: "0x668a0f02" }, "latest" ])), round);
+            const byId = words(await ok("eth_call", [ { to: FEED, data: "0x9a6fc8f5" + word(round!) }, "latest" ]));
+            assert.equal(byId[1], 61250000000n, "getRoundData for the overridden round");
+        });
+
+        it("leaves every other call to the feed's own code", async () => {
+            const env = await newEnv({ name: "oracle-delegate" });
+            const ok = okFor(env.id);
+            const description = await ok("eth_call", [ { to: FEED, data: "0x7284e416" }, "latest" ]);
+            const aggregator = await ok("eth_call", [ { to: FEED, data: "0x245a7bfc" }, "latest" ]);
+            await ok("forkstate_setPrice", [ FEED, "1" ]);
+            assert.equal(await ok("eth_call", [ { to: FEED, data: "0x7284e416" }, "latest" ]), description);
+            assert.equal(await ok("eth_call", [ { to: FEED, data: "0x245a7bfc" }, "latest" ]), aggregator);
+            assert.equal(BigInt(await ok("eth_call", [ { to: FEED, data: "0x313ce567" }, "latest" ])), 8n);
+        });
+
+        it("changes again, takes raw and negative answers, and puts the real feed back", async () => {
+            const env = await newEnv({ name: "oracle-reset" });
+            const ok = okFor(env.id);
+            const real = await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ]);
+            const first = await ok("forkstate_setPrice", [ FEED, "100" ]);
+            const second = await ok("forkstate_setPrice", [ FEED, "0x5" ]);
+            assert.equal(second.roundId, first.roundId, "overriding again keeps the round");
+            assert.equal(BigInt(await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ])), 5n);
+
+            await ok("forkstate_setPrice", [ FEED, "-1.5" ]);
+            const negative = await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ]);
+            assert.equal(BigInt.asIntN(256, BigInt(negative)), -150000000n);
+
+            assert.deepEqual(await ok("forkstate_resetPrice", [ FEED ]), { reset: true });
+            assert.equal(await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ]), real,
+                "the original code, not the first override");
+            assert.deepEqual(await ok("forkstate_resetPrice", [ FEED ]), { reset: false });
+        });
+
+        it("is kept like any other write", async () => {
+            const env = await newEnv({ name: "oracle-restart" });
+            const ok = okFor(env.id);
+            await ok("forkstate_setPrice", [ FEED, "42" ]);
+            await manager.evict(env.id);
+            assert.equal(BigInt(await ok("eth_call", [ { to: FEED, data: "0x50d25bcd" }, "latest" ])), 4200000000n);
+        });
+
+        it("says plainly what is wrong", async () => {
+            const env = await newEnv({ name: "oracle-refusals" });
+            const call = rpcFor(env.id);
+            assert.match((await call("forkstate_setPrice", [ DEAD, "1" ])).error?.message ?? "", /no contract/);
+            assert.match((await call("forkstate_setPrice", [ USDT, "1" ])).error?.message ?? "", /not a Chainlink-style price feed/);
+            assert.match((await call("forkstate_setPrice", [ FEED, "1.123456789" ])).error?.message ?? "", /8 decimals/);
+            assert.match((await call("forkstate_setPrice", [ FEED, "cheap" ])).error?.message ?? "", /not a price/);
+        });
+    });
+
     describe("state at past blocks", () => {
         // Init code that returns block.number, and block.timestamp: a call with
         // no `to` runs it and hands back what it returned.
