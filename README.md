@@ -48,6 +48,15 @@ parent chain's state, which is the same for all of them anyway.
 curl -X POST localhost:8546/environments -d '{"name":"alice"}'
 #  { "id": "7105ce1d", "rpcUrl": "http://127.0.0.1:8546/7105ce1d", … }
 
+# a copy that starts exactly where this one is, then goes its own way
+curl -X POST localhost:8546/environments/7105ce1d/clone -d '{"name":"alice-2"}'
+
+# named snapshots, kept until deleted and restorable any number of times
+curl -X POST localhost:8546/environments/7105ce1d/snapshots -d '{"name":"before upgrade"}'
+curl localhost:8546/environments/7105ce1d/snapshots
+curl -X POST localhost:8546/environments/7105ce1d/snapshots/<snapshot-id>/restore
+curl -X DELETE localhost:8546/environments/7105ce1d/snapshots/<snapshot-id>
+
 curl -X DELETE localhost:8546/environments/7105ce1d
 ```
 

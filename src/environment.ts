@@ -399,6 +399,10 @@ export class Environment {
     /** The fork block's real hash: the parent of the first block mined here. */
     private forkHash: string | null = null;
     private autoImpersonate = false;
+    /** Set on an environment rebuilt at a past block, which then answers as that block. */
+    private pinned: { number: number; timestamp: number } | null = null;
+    /** The last past block rebuilt, kept while nothing has changed since. */
+    private past: { key: string; env: Environment } | null = null;
     /** Off while a call runs: a call is reverted, so what it wrote is not ours to keep. */
     private recording = true;
 
@@ -430,14 +434,15 @@ export class Environment {
     static async create(options: EnvironmentOptions): Promise<Environment> {
         const { rpcUrl } = options;
 
-        const parentChainId = Number(BigInt(await rpc<string>(rpcUrl, "eth_chainId", [])));
         let forkBlock = options.forkBlock;
         if (forkBlock === undefined) {
             const head = BigInt(await rpc<string>(rpcUrl, "eth_blockNumber", []));
             const checkpoint = BigInt(options.checkpoint ?? 0);
             forkBlock = checkpoint > 1n ? (head / checkpoint) * checkpoint : head;
         }
-        const chainId = options.chainId ?? parentChainId;
+        // Only asked when it is needed: a restore already knows, and one round
+        // trip fewer is most of the time a rebuild takes.
+        const chainId = options.chainId ?? Number(BigInt(await rpc<string>(rpcUrl, "eth_chainId", [])));
 
         const state = new ForkStateManager({ provider: rpcUrl, blockTag: forkBlock, cache: options.cache });
         // Mainnet rules with the chain id swapped: the fork runs the same EVM as the
@@ -484,8 +489,10 @@ export class Environment {
             // a value that should keep tracking the parent.
             const isFill = (this.state as ForkStateManager).filling;
             if (this.recording && !this.suppress && !isFill) {
-                const account = this.track(address.toString());
-                (account.storage ??= {})[normaliseWord(bytesToHex(key))] = normaliseWord(bytesToHex(value));
+                const slot = normaliseWord(bytesToHex(key));
+                const word = normaliseWord(bytesToHex(value));
+                this.remember(address.toString(), "storage", word, slot);
+                (this.track(address.toString()).storage ??= {})[slot] = word;
             }
             if (this.capturing && !isFill) {
                 await this.noteSlot(address.toString(), bytesToHex(key), bytesToHex(value));
@@ -496,15 +503,22 @@ export class Environment {
         state.putAccount = async (address, account) => {
             if (this.capturing && account) await this.noteAccount(address, account);
             if (this.recording && !this.suppress && account) {
+                const balance = "0x" + account.balance.toString(16);
+                const nonce = "0x" + account.nonce.toString(16);
+                this.remember(address.toString(), "balance", balance);
+                this.remember(address.toString(), "nonce", nonce);
                 const entry = this.track(address.toString());
-                entry.balance = "0x" + account.balance.toString(16);
-                entry.nonce = "0x" + account.nonce.toString(16);
+                entry.balance = balance;
+                entry.nonce = nonce;
             }
             return putAccount(address, account);
         };
 
         state.putCode = async (address, code) => {
-            if (this.recording && !this.suppress) this.track(address.toString()).code = bytesToHex(code);
+            if (this.recording && !this.suppress) {
+                this.remember(address.toString(), "code", bytesToHex(code));
+                this.track(address.toString()).code = bytesToHex(code);
+            }
             return putCode(address, code);
         };
     }
@@ -548,11 +562,26 @@ export class Environment {
         return this.overlay.accounts[key] ??= {};
     }
 
+    /**
+     * Notes what the overlay held before a write, so the block that makes it
+     * can be undone when someone asks about an earlier one.
+     */
+    private remember(address: string, field: "balance" | "nonce" | "code" | "storage", next: string, slot?: string): void {
+        if (this.suppress) return;
+        const key = normaliseAddress(address);
+        const account = this.overlay.accounts[key];
+        const before = (field === "storage" ? account?.storage?.[slot!] : account?.[field]) ?? null;
+        // Writing a value that is already there changes nothing worth undoing.
+        if (before === next) return;
+        this.chain.note(`${key}/${field === "storage" ? slot : field}`, before);
+    }
+
     async setBalance(address: string, wei: bigint): Promise<void> {
         const addr = createAddressFromString(normaliseAddress(address));
         const account = (await this.state.getAccount(addr)) ?? new Account();
         account.balance = wei;
         await this.state.putAccount(addr, account);
+        this.remember(address, "balance", "0x" + wei.toString(16));
         this.track(address).balance = "0x" + wei.toString(16);
     }
 
@@ -561,12 +590,14 @@ export class Environment {
         const account = (await this.state.getAccount(addr)) ?? new Account();
         account.nonce = nonce;
         await this.state.putAccount(addr, account);
+        this.remember(address, "nonce", "0x" + nonce.toString(16));
         this.track(address).nonce = "0x" + nonce.toString(16);
     }
 
     async setCode(address: string, code: string): Promise<void> {
         const addr = createAddressFromString(normaliseAddress(address));
         await this.state.putCode(addr, hexToBytes(code as `0x${string}`));
+        this.remember(address, "code", code);
         this.track(address).code = code;
     }
 
@@ -575,6 +606,7 @@ export class Environment {
         const key = normaliseWord(slot);
         const word = normaliseWord(value);
         await this.state.putStorage(addr, hexToBytes(key as `0x${string}`), hexToBytes(word as `0x${string}`));
+        this.remember(address, "storage", word, key);
         const account = this.track(address);
         (account.storage ??= {})[key] = word;
     }
@@ -1226,6 +1258,8 @@ export class Environment {
      * deadline treats as impossible.
      */
     private nextBlock(): { number: number; timestamp: number } {
+        // Rebuilt at a past block: a call there sees that block, as a node's does.
+        if (this.pinned) return this.pinned;
         const now = Math.floor(Date.now() / 1000) + this.timeOffset;
         return {
             number: this.chain.height + 1,
@@ -1345,6 +1379,42 @@ export class Environment {
         return this.chain.height;
     }
 
+    /** The oldest block whose state `at` can rebuild. */
+    get historyFrom(): number {
+        return this.chain.historyFrom;
+    }
+
+    /**
+     * This environment as it was when block `number` was mined.
+     *
+     * The overlay as it is now, with every later block's changes undone from
+     * the newest back; what is left is the state at that block, over the same
+     * fork of the parent. Built as a whole environment rather than a lookup,
+     * so `eth_call` at a past block runs real code against real state, and
+     * sees that block's number and time.
+     *
+     * Kept until anything changes, because a tool that asks about a block
+     * usually asks several questions about it.
+     */
+    async at(number: number): Promise<Environment> {
+        const key = `${number}:${this.revision}:${this.forkBlock}`;
+        if (this.past?.key === key) return this.past.env;
+
+        const overlay = structuredClone(this.overlay);
+        for (const journal of this.chain.journalsAfter(number)) {
+            for (const [ entry, before ] of Object.entries(journal)) undo(overlay, entry, before);
+        }
+        overlay.blockNumber = number - Number(this.forkBlock);
+
+        const env = await Environment.restore(overlay, this.rpcUrl, this.chain.exportUpTo(number), this.cache);
+        const block = this.chain.getBlock(number);
+        env.pinned = { number, timestamp: block?.timestamp ?? 0 };
+        // Its reads of the parent are this environment's, and paid for the same way.
+        env.onUpstreamFetch = this.upstreamFetch;
+        this.past = { key, env };
+        return env;
+    }
+
     getBlock(id: number | string): StoredBlock | null {
         return this.chain.getBlock(id);
     }
@@ -1393,6 +1463,7 @@ export class Environment {
         this.overlay.blockNumber = saved.overlay.blockNumber;
         this.timeOffset = saved.time;
         this.chain.rollbackTo(saved.chain.forkHeight + saved.chain.blocks.length);
+        this.chain.resetHistory(saved.chain.history);
 
         // A fresh state manager, not a patched one.
         //
@@ -1870,8 +1941,25 @@ export class Environment {
         if (chain) {
             const restored = Chain.restore(chain);
             (env as unknown as { chain: Chain }).chain = restored;
+        } else {
+            // Replaying the overlay noted every value as a change; none of them was.
+            env.chain.resetHistory();
         }
         return env;
+    }
+}
+
+/** Puts one journal entry's before-value back into an overlay. */
+function undo(overlay: Overlay, entry: string, before: string | null): void {
+    const [ address, field ] = entry.split("/") as [ string, string ];
+    const account = overlay.accounts[address] ??= {};
+    if (field === "balance" || field === "nonce" || field === "code") {
+        if (before === null) delete account[field];
+        else account[field] = before;
+    } else if (before === null) {
+        if (account.storage) delete account.storage[field];
+    } else {
+        (account.storage ??= {})[field] = before;
     }
 }
 

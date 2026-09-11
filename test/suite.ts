@@ -1541,7 +1541,14 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
                 // Three attempts, a second apart, before it gives up on this one.
                 await hook.waitFor(3, 15_000);
 
-                const deliveries = await ok("forkstate_alertDeliveries", [ alert.id ]);
+                // The delivery is written once the last attempt has been
+                // answered, which is just after the receiver sees it — a moment
+                // that is longer against Postgres than against a local file.
+                let deliveries: any[] = [];
+                for (let tries = 0; tries < 50 && deliveries.length === 0; tries++) {
+                    deliveries = await ok("forkstate_alertDeliveries", [ alert.id ]);
+                    if (deliveries.length === 0) await new Promise((r) => setTimeout(r, 100));
+                }
                 assert.equal(deliveries.length, 1, "one delivery, however many attempts");
                 assert.equal(deliveries[0].ok, false);
                 assert.equal(deliveries[0].status, 500);
@@ -1692,6 +1699,141 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             } finally {
                 hook.close();
             }
+        });
+    });
+
+    describe("state at past blocks", () => {
+        // Init code that returns block.number, and block.timestamp: a call with
+        // no `to` runs it and hands back what it returned.
+        const NUMBER = "0x4360005260206000f3";
+        const TIME = "0x4260005260206000f3";
+        const at = (n: number) => "0x" + n.toString(16);
+
+        async function counter(name: string) {
+            const env = await newEnv({ name });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ HOLDER, "0x56bc75e2d63100000" ]);
+            const hash = await ok("eth_sendTransaction", [ { from: HOLDER, data: CREATION } ]);
+            const receipt = await ok("eth_getTransactionReceipt", [ hash ]);
+            return { env, ok, address: receipt.contractAddress as string, deployed: Number(receipt.blockNumber) };
+        }
+        const add = (ok: ReturnType<typeof okFor>, address: string, n: number) =>
+            ok("eth_sendTransaction", [ { from: HOLDER, to: address, data: "0xb20eb4c4" + word(BigInt(n)) } ]);
+
+        it("answers storage, code, nonces and calls as they were at each block", async () => {
+            const { env, ok, address, deployed } = await counter("history-values");
+            const fork = Number(env.forkBlock);
+            const nonceAtFork = Number(await ok("eth_getTransactionCount", [ HOLDER, at(fork) ]));
+            await add(ok, address, 5);
+            await add(ok, address, 7);
+            assert.equal(Number(await ok("eth_blockNumber")), deployed + 2);
+
+            assert.equal(await ok("eth_getStorageAt", [ address, "0x0", at(deployed) ]), "0x" + word(0n));
+            assert.equal(await ok("eth_getStorageAt", [ address, "0x0", at(deployed + 1) ]), "0x" + word(5n));
+            assert.equal(await ok("eth_getStorageAt", [ address, "0x0", "latest" ]), "0x" + word(12n));
+
+            assert.equal(await ok("eth_call", [ { to: address, data: "0x2ddbd13a" }, at(deployed + 1) ]), "0x" + word(5n));
+            assert.equal(await ok("eth_call", [ { to: address, data: "0x2ddbd13a" }, "latest" ]), "0x" + word(12n));
+
+            assert.equal(await ok("eth_getCode", [ address, at(fork) ]), "0x", "before the deployment, nothing");
+            assert.notEqual(await ok("eth_getCode", [ address, at(deployed) ]), "0x");
+
+            assert.equal(Number(await ok("eth_getTransactionCount", [ HOLDER, at(deployed) ])), nonceAtFork + 1);
+            assert.equal(Number(await ok("eth_getTransactionCount", [ HOLDER, at(deployed + 1) ])), nonceAtFork + 2);
+
+            // EIP-1898, by hash.
+            const block = await ok("eth_getBlockByNumber", [ at(deployed + 1), false ]);
+            assert.equal(await ok("eth_getStorageAt", [ address, "0x0", { blockHash: block.hash } ]), "0x" + word(5n));
+        });
+
+        it("runs a call at a past block as that block", async () => {
+            const env = await newEnv({ name: "history-context" });
+            const ok = okFor(env.id);
+            await ok("evm_mine");
+            await ok("evm_increaseTime", [ 3600 ]);
+            await ok("evm_mine");
+            const target = Number(env.forkBlock) + 2;
+            const block = await ok("eth_getBlockByNumber", [ at(target), false ]);
+
+            assert.equal(await ok("eth_call", [ { data: NUMBER }, at(target) ]), "0x" + word(BigInt(target)));
+            assert.equal(await ok("eth_call", [ { data: TIME }, at(target) ]), "0x" + word(BigInt(block.timestamp)));
+        });
+
+        it("puts a cheatcode's change in the block that followed it", async () => {
+            const env = await newEnv({ name: "history-cheats" });
+            const ok = okFor(env.id);
+            const fork = Number(env.forkBlock);
+            const parent = await ok("eth_getBalance", [ DEAD, at(fork) ]);
+
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            await ok("anvil_setBalance", [ DEAD, "0x2" ]);
+            await ok("anvil_setStorageAt", [ DEAD, "0x1", "0x" + word(9n) ]);
+            await ok("evm_mine");
+            await ok("anvil_setBalance", [ DEAD, "0x3" ]);
+
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork + 1) ]), "0x1");
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork + 2) ]), "0x3",
+                "the head includes what has been set since it was mined, as on anvil");
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork) ]), parent);
+            assert.equal(await ok("eth_getStorageAt", [ DEAD, "0x1", at(fork + 1) ]), "0x" + word(0n),
+                "a slot never written here reads through to the parent");
+
+            await ok("evm_mine");
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork + 2) ]), "0x2");
+            assert.equal(await ok("eth_getStorageAt", [ DEAD, "0x1", at(fork + 2) ]), "0x" + word(9n));
+        });
+
+        it("still knows after a restart", async () => {
+            const env = await newEnv({ name: "history-restart" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            await ok("anvil_setBalance", [ DEAD, "0x2" ]);
+            await ok("evm_mine");
+            await manager.evict(env.id);
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(Number(env.forkBlock) + 1) ]), "0x1");
+        });
+
+        it("goes back with evm_revert, and forward on the new blocks", async () => {
+            const env = await newEnv({ name: "history-revert" });
+            const ok = okFor(env.id);
+            const fork = Number(env.forkBlock);
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            const snap = await ok("evm_snapshot");
+            await ok("anvil_setBalance", [ DEAD, "0x2" ]);
+            await ok("evm_mine");
+            await ok("evm_revert", [ snap ]);
+            await ok("anvil_setBalance", [ DEAD, "0x9" ]);
+            await ok("evm_mine");
+            await ok("evm_mine");
+
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork + 1) ]), "0x1");
+            assert.equal(await ok("eth_getBalance", [ DEAD, at(fork + 2) ]), "0x9", "the new block, not the undone one");
+        });
+
+        it("comes along with a clone", async () => {
+            const env = await newEnv({ name: "history-clone" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            await ok("anvil_setBalance", [ DEAD, "0x2" ]);
+            await ok("evm_mine");
+            const made = await (await fetch(`${BASE}/environments/${env.id}/clone`, { method: "POST" })).json() as { id: string };
+            assert.equal(await okFor(made.id)("eth_getBalance", [ DEAD, at(Number(env.forkBlock) + 1) ]), "0x1");
+        });
+
+        it("says plainly when a block is older than it keeps", async () => {
+            const env = await newEnv({ name: "history-window" });
+            const ok = okFor(env.id);
+            await ok("anvil_setBalance", [ DEAD, "0x1" ]);
+            await ok("evm_mine");
+            await ok("anvil_mine", [ "0x401" ]);
+            const answer = await rpcFor(env.id)("eth_getBalance", [ DEAD, at(Number(env.forkBlock) + 1) ]);
+            assert.match(answer.error?.message ?? "", /no longer kept/);
+            const recent = Number(await ok("eth_blockNumber")) - 1;
+            assert.ok((await rpcFor(env.id)("eth_getBalance", [ DEAD, at(recent) ])).result, "a recent block still answers");
         });
     });
 
@@ -2174,7 +2316,7 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             assert.equal(BigInt(here), BigInt(direct.result));
         });
 
-        it("says so, rather than answering with today's state, for a past block mined here", async () => {
+        it("answers a past block mined here with the state it had then, not today's", async () => {
             const env = await newEnv({ name: "real-history-local" });
             const ok = okFor(env.id);
             const X = "0x000000000000000000000000000000000000fe03";
@@ -2183,8 +2325,7 @@ describe("forkstate", { skip: RPC ? false : "set FORKSTATE_RPC to run" }, () => 
             const then = await ok("eth_blockNumber");
             await ok("anvil_setBalance", [ X, "0x2" ]);
             await ok("anvil_mine", [ "0x1" ]);
-            const answer = await rpcFor(env.id)("eth_getBalance", [ X, then ]);
-            assert.match(answer.error!.message, /not kept/);
+            assert.equal(await ok("eth_getBalance", [ X, then ]), "0x1");
             assert.equal(await ok("eth_getBalance", [ X, "latest" ]), "0x2");
             assert.equal(await ok("eth_getBalance", [ X, await ok("eth_blockNumber") ]), "0x2",
                 "the latest block by number is still answered");

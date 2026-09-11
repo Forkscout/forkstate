@@ -218,7 +218,7 @@ function receiptToRpc(tx: StoredTx): unknown {
  * parent's state at that block, so it is asked there. A block mined here but
  * not the latest has no state kept for it, and saying so beats making one up.
  */
-type StateAt = { where: "here" } | { where: "parent" } | { where: "nowhere"; message: string };
+type StateAt = { where: "here" } | { where: "parent" } | { where: "past"; number: number } | { where: "nowhere"; message: string };
 
 function stateAt(env: Environment, tag: unknown): StateAt {
     if (tag === undefined || tag === null) return { where: "here" };
@@ -245,10 +245,11 @@ function stateAt(env: Environment, tag: unknown): StateAt {
     if (number === latest) return { where: "here" };
     if (number > latest) return { where: "nowhere", message: `header not found: block ${number} is not mined yet` };
     if (number <= fork) return { where: "parent" };
+    if (number >= env.historyFrom) return { where: "past", number };
     return {
         where: "nowhere",
-        message: `state is not kept for past blocks mined on this fork (${fork + 1}–${latest - 1}); `
-            + `ask for "latest", or for a block at or before the fork (${fork})`,
+        message: `state for block ${number} is no longer kept: this fork keeps it from block `
+            + `${env.historyFrom} to ${latest}, and the parent answers for ${fork} and before`,
     };
 }
 
@@ -334,10 +335,11 @@ export async function handleRpc(
                 const at = stateAt(env, params[method === "eth_getStorageAt" ? 2 : 1]);
                 if (at.where === "parent") return reply(await env.passthrough(method, params));
                 if (at.where === "nowhere") return fail(at.message);
-                if (method === "eth_getBalance") return reply(hex(await env.getBalance(String(params[0]))));
-                if (method === "eth_getTransactionCount") return reply(hex(await env.getNonce(String(params[0]))));
-                if (method === "eth_getCode") return reply(await env.getCode(String(params[0])));
-                return reply(await env.getStorageAt(String(params[0]), String(params[1])));
+                const then = at.where === "past" ? await env.at(at.number) : env;
+                if (method === "eth_getBalance") return reply(hex(await then.getBalance(String(params[0]))));
+                if (method === "eth_getTransactionCount") return reply(hex(await then.getNonce(String(params[0]))));
+                if (method === "eth_getCode") return reply(await then.getCode(String(params[0])));
+                return reply(await then.getStorageAt(String(params[0]), String(params[1])));
             }
 
             // ---- execution
@@ -346,9 +348,10 @@ export async function handleRpc(
                 if (at.where === "parent") return reply(await env.passthrough(method, params));
                 if (at.where === "nowhere") return fail(at.message);
                 const call = params[0] as Record<string, string>;
+                const then = at.where === "past" ? await env.at(at.number) : env;
                 // The third parameter, as Geth defines it: state to pretend is
                 // true for this call only.
-                const result = await env.call(call, params[2] as StateOverrides | undefined);
+                const result = await then.call(call, params[2] as StateOverrides | undefined);
                 if (result.reverted) return fail(result.error ?? "execution reverted", 3);
                 return reply(result.returnValue);
             }

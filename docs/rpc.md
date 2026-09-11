@@ -12,6 +12,27 @@ curl -s localhost:8546/7105ce1d \
 Anything not listed here is forwarded to the parent chain, which is where the
 history from before the fork lives.
 
+## State at past blocks
+
+`eth_getBalance`, `eth_getTransactionCount`, `eth_getCode`, `eth_getStorageAt`
+and `eth_call` take a block, by number, tag or EIP-1898 object:
+
+| Block asked about | Answered by |
+| --- | --- |
+| `latest`, `pending`, or the newest block's number | the environment as it is now |
+| a block at or before the fork | the parent chain, as it was then |
+| one of the last 1,024 blocks mined here | the environment as it was when that block was mined |
+| an older block mined here | an error naming the range that is kept |
+
+Each mined block keeps a journal of the values it changed, as they were before
+it. A past block's state is the current overlay with every later journal undone,
+newest first. `eth_call` at a past block runs against that state and sees that
+block's `number` and `timestamp`.
+
+Journals are kept with the chain, so they survive a restart and travel with a
+clone, a snapshot and `evm_revert`. Following the parent's head clears them:
+below the new fork point the parent answers instead.
+
 ## Beyond the standard
 
 ### `eth_call` with state overrides

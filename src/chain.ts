@@ -37,6 +37,37 @@ export interface StoredTx {
     revertData?: string | null;
 }
 
+/**
+ * What one block changed, as the values the overlay held before it.
+ *
+ * Keyed `address/balance`, `address/nonce`, `address/code` or `address/slot`.
+ * Null means the overlay did not hold that value yet — the parent's showed
+ * through — so going back past this block means reading the parent again.
+ *
+ * Before-values rather than after-values because the question is always "what
+ * was it then": start from the overlay as it is, undo block by block from the
+ * newest, and what is left is the state at the block asked about.
+ */
+export type Journal = Record<string, string | null>;
+
+/**
+ * How many blocks of state are kept.
+ *
+ * A full Ethereum node keeps 128; an archive node keeps everything and costs
+ * terabytes. A fork's journal is only what it changed, so it can afford more
+ * than a full node — but every block's journal is written with the
+ * environment, so it cannot be unbounded either.
+ */
+export const HISTORY_BLOCKS = 1024;
+
+export interface History {
+    /** The oldest block whose state can be rebuilt. */
+    from: number;
+    /** Changes since the last block, which the next block will own. */
+    pending: Journal;
+    blocks: Record<string, Journal>;
+}
+
 export interface StoredBlock {
     number: number;
     hash: string;
@@ -64,8 +95,57 @@ export class Chain {
      */
     private forkHeightValue: number;
 
+    private journals = new Map<number, Journal>();
+    private pending: Journal = {};
+    private historyFromValue: number;
+
     constructor(forkHeight: number) {
         this.forkHeightValue = forkHeight;
+        this.historyFromValue = forkHeight;
+    }
+
+    /** The oldest block the state of which can still be rebuilt. */
+    get historyFrom(): number {
+        return this.historyFromValue;
+    }
+
+    /**
+     * Records what a value was before this block first changed it.
+     *
+     * Only the first change in a block counts: that is the value the block
+     * started from, and later writes in the same block are its own business.
+     */
+    note(key: string, before: string | null): void {
+        if (!(key in this.pending)) this.pending[key] = before;
+    }
+
+    /** Every journal after `number`, newest first — the order to undo them in. */
+    journalsAfter(number: number): Journal[] {
+        const out = [ this.pending ];
+        for (let n = this.height; n > number; n--) {
+            const journal = this.journals.get(n);
+            if (journal) out.push(journal);
+        }
+        return out;
+    }
+
+    /** The chain as it stood at `number`, for rebuilding an environment there. */
+    exportUpTo(number: number): ReturnType<Chain["export"]> {
+        const blocks = this.blocks.filter((block) => block.number <= number);
+        const kept = new Set(blocks.flatMap((block) => block.transactions.map((hash) => hash.toLowerCase())));
+        return {
+            forkHeight: this.forkHeightValue,
+            blocks,
+            txs: [ ...this.txs.values() ].filter((tx) => kept.has(tx.hash.toLowerCase())),
+            history: { from: number, pending: {}, blocks: {} },
+        };
+    }
+
+    /** Puts back the history a snapshot held, as evm_revert does with everything else. */
+    resetHistory(history?: History): void {
+        this.pending = { ...(history?.pending ?? {}) };
+        this.journals = new Map(Object.entries(history?.blocks ?? {}).map(([ n, j ]) => [ Number(n), { ...j } ]));
+        this.historyFromValue = history?.from ?? this.height;
     }
 
     get forkHeight(): number {
@@ -99,6 +179,11 @@ export class Chain {
     advanceForkTo(height: number): boolean {
         if (height <= this.height) return false;
         this.forkHeightValue = height;
+        // The journals undo writes made against the old fork block. Below the
+        // new one the parent answers, so they have nothing left to undo.
+        this.journals.clear();
+        this.pending = {};
+        this.historyFromValue = height;
         return true;
     }
 
@@ -125,6 +210,16 @@ export class Chain {
         this.byHash.set(block.hash.toLowerCase(), block);
         this.byNumber.set(block.number, block);
         for (const tx of transactions) this.txs.set(tx.hash.toLowerCase(), tx);
+
+        this.journals.set(block.number, this.pending);
+        this.pending = {};
+        // Oldest first, because blocks are only ever added at the top.
+        while (this.journals.size > HISTORY_BLOCKS) {
+            const oldest = this.journals.keys().next().value as number;
+            this.journals.delete(oldest);
+            // Without that block's journal, the state before it cannot be rebuilt.
+            this.historyFromValue = Math.max(this.historyFromValue, oldest);
+        }
     }
 
     /**
@@ -139,14 +234,24 @@ export class Chain {
             this.byHash.delete(block.hash.toLowerCase());
             this.byNumber.delete(block.number);
             for (const hash of block.transactions) this.txs.delete(hash.toLowerCase());
+            this.journals.delete(block.number);
         }
     }
 
-    export(): { forkHeight: number; blocks: StoredBlock[]; txs: StoredTx[] } {
-        return { forkHeight: this.forkHeightValue, blocks: this.blocks, txs: [ ...this.txs.values() ] };
+    export(): { forkHeight: number; blocks: StoredBlock[]; txs: StoredTx[]; history?: History } {
+        return {
+            forkHeight: this.forkHeightValue,
+            blocks: this.blocks,
+            txs: [ ...this.txs.values() ],
+            history: {
+                from: this.historyFromValue,
+                pending: this.pending,
+                blocks: Object.fromEntries(this.journals),
+            },
+        };
     }
 
-    static restore(data: { forkHeight: number; blocks: StoredBlock[]; txs: StoredTx[] }): Chain {
+    static restore(data: { forkHeight: number; blocks: StoredBlock[]; txs: StoredTx[]; history?: History }): Chain {
         const chain = new Chain(data.forkHeight);
         for (const block of data.blocks) {
             chain.blocks.push(block);
@@ -154,6 +259,9 @@ export class Chain {
             chain.byNumber.set(block.number, block);
         }
         for (const tx of data.txs) chain.txs.set(tx.hash.toLowerCase(), tx);
+        // A row written before history was kept has none: its past blocks stay
+        // unanswerable, and everything mined from now on is recorded.
+        chain.resetHistory(data.history);
         return chain;
     }
 }
